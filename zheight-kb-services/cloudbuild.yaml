@@ -1,0 +1,73 @@
+steps:
+  # Build ingestion service
+  - name: 'gcr.io/cloud-builders/docker'
+    id: build-ingestion
+    args:
+      - build
+      - -f
+      - services/ingestion/Dockerfile
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/ingestion:$TAG_NAME
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/ingestion:latest
+      - .
+    waitFor: ['-']
+
+  # Build rag-api service
+  - name: 'gcr.io/cloud-builders/docker'
+    id: build-rag-api
+    args:
+      - build
+      - -f
+      - services/rag-api/Dockerfile
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/rag-api:$TAG_NAME
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/rag-api:latest
+      - .
+    waitFor: ['-']
+
+  # Build quality-gate service
+  - name: 'gcr.io/cloud-builders/docker'
+    id: build-quality-gate
+    args:
+      - build
+      - -f
+      - services/quality-gate/Dockerfile
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/quality-gate:$TAG_NAME
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/quality-gate:latest
+      - .
+    waitFor: ['-']
+
+  # Push all images
+  - name: 'gcr.io/cloud-builders/docker'
+    id: push-ingestion
+    args: ['push', '--all-tags',
+           'us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/ingestion']
+    waitFor: ['build-ingestion']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: push-rag-api
+    args: ['push', '--all-tags',
+           'us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/rag-api']
+    waitFor: ['build-rag-api']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: push-quality-gate
+    args: ['push', '--all-tags',
+           'us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/quality-gate']
+    waitFor: ['build-quality-gate']
+
+images:
+  - us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/ingestion:$TAG_NAME
+  - us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/rag-api:$TAG_NAME
+  - us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/quality-gate:$TAG_NAME
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+
+tags:
+  - zheight-phase2

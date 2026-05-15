@@ -1,0 +1,11 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -f
+      - services/quality-gate/Dockerfile
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/quality-gate:v2.0
+      - .
+images:
+  - us-central1-docker.pkg.dev/$PROJECT_ID/zheight-services/quality-gate:v2.0

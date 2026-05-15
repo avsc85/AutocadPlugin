@@ -1,0 +1,42 @@
+# ── Build outputs ─────────────────────────────────────────────────────────────
+bin/
+obj/
+*.dll
+*.pdb
+*.exe
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vs/
+*.user
+.idea/
+*.suo
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# ── Secrets / credentials ─────────────────────────────────────────────────────
+*.env
+.env.*
+config.dat
+*service-account*.json
+*credentials*.json
+*.key
+
+# ── Claude Code local memory ──────────────────────────────────────────────────
+.claude/
+
+# ── Logs / temp ───────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.cache
+
+# ── GCP / Terraform state ────────────────────────────────────────────────────
+.terraform/
+*.tfstate
+*.tfstate.backup
