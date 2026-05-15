@@ -57,6 +57,11 @@ You are an architectural programme parser.
 Extract structured parameters from an architect's description.
 Output JSON only. No markdown. No explanation.
 Be inclusive: accept any building type, any language mix.
+IMPORTANT: Always output total_area_sqm in SQUARE METRES (sqm).
+  Convert from sqft: 1 sqft = 0.0929 sqm (e.g. 1200 sqft = 111.5 sqm).
+  Convert from sqm: use as-is.
+IMPORTANT: Output total_area_sqm as the HOUSE FLOOR AREA, not the site/lot area.
+  Site area goes into site_context.plot_area_sqm.
 """
 
 GEN_SYSTEM = """
@@ -362,7 +367,7 @@ async def orchestrate(request: Request, req: PluginRequest):
     log.info("orchestrate_start",
              request_id=request_id,
              prompt=req.prompt[:120],
-             category=req.project_category,
+             category=req.project_category or "(from intent)",
              units=req.autocad_units)
 
     client = await _get_client()
@@ -395,8 +400,11 @@ async def orchestrate(request: Request, req: PluginRequest):
             "intent_weight": 0.2,
         }
 
-    category = req.project_category or intent.get("project_category", "residential")
+    category = req.project_category or intent.get("project_category", "residential") or "residential"
     area_sqm = req.total_area_sqm or intent.get("total_area_sqm")
+    # If Gemini returned area > 2000 it likely kept sqft — convert to sqm
+    if area_sqm and float(area_sqm) > 2000:
+        area_sqm = round(float(area_sqm) / 10.764, 1)
     site_ctx = {**intent.get("site_context", {}), **req.site_context}
     reg_ctx  = {**intent.get("regulatory_constraints", {}), **req.regulatory_constraints}
     design   = {**intent.get("design_intent", {}), **req.design_intent}
@@ -534,6 +542,7 @@ INSTRUCTIONS:
     choices — adapt spatial intelligence to this brief, do not copy areas or layouts."""
 
     # ── 4. Generate ───────────────────────────────────────────────────────────
+    generation: dict = {}
     for attempt in range(1, 3):
         try:
             gen_resp = await asyncio.to_thread(
@@ -551,13 +560,26 @@ INSTRUCTIONS:
             raw = gen_resp.text.strip()
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
-            generation = json.loads(raw)
-            # Gemini occasionally wraps the response in a JSON array — unwrap it
-            if isinstance(generation, list):
-                if generation and isinstance(generation[0], dict):
-                    generation = generation[0]
+            parsed = json.loads(raw)
+            log.debug("generation_raw_type",
+                      attempt=attempt, type=type(parsed).__name__,
+                      preview=str(raw)[:120])
+            # Unwrap list wrapper — Gemini sometimes returns [{...}] instead of {...}
+            # Walk up to 3 levels deep to handle nested list wrapping
+            for _ in range(3):
+                if not isinstance(parsed, list):
+                    break
+                if parsed and isinstance(parsed[0], dict):
+                    parsed = parsed[0]
+                elif parsed and isinstance(parsed[0], list):
+                    parsed = parsed[0]  # peel one layer, keep looping
                 else:
-                    raise json.JSONDecodeError("Expected object, got list", raw, 0)
+                    raise json.JSONDecodeError(
+                        f"Unwrappable list structure (len={len(parsed)})", raw, 0)
+            if not isinstance(parsed, dict):
+                raise json.JSONDecodeError(
+                    f"Expected JSON object, got {type(parsed).__name__}", raw, 0)
+            generation = parsed
             break
         except json.JSONDecodeError as exc:
             if attempt == 2:
@@ -567,6 +589,9 @@ INSTRUCTIONS:
         except Exception as exc:
             log.error("generation_error", error=str(exc))
             raise HTTPException(500, f"Generation failed: {exc}")
+
+    if not generation:
+        raise HTTPException(500, "Generation produced empty response after retries")
 
     generation["total_area_sqm"] = area_sqm or generation.get("total_area_sqm", 100)
     generation["project_category"] = category
