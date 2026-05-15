@@ -6,11 +6,14 @@ request ID propagation, backward-compat routes preserved.
 Auth uses RAG_API_KEY env var (secret: rag-api-key in Secret Manager).
 """
 from __future__ import annotations
-import os, uuid
+import os, sys, uuid, time
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+sys.path.insert(0, "/app")
+from shared.db.client import get_db
 
 from .routers import generate, search, upload
 from .routers.orchestrate import router as orchestrate_router
@@ -19,6 +22,42 @@ from .routers.feedback    import router as feedback_router
 log = structlog.get_logger()
 
 API_KEY = os.environ.get("RAG_API_KEY", "")
+
+# E-02: Redis is optional infrastructure — cache state to avoid hammering on startup
+_redis_available: bool | None = None   # None = not yet checked
+_redis_last_check: float      = 0.0    # epoch seconds of last probe
+_REDIS_RECHECK_INTERVAL       = 60.0   # re-probe at most once per minute
+
+
+async def _check_redis() -> bool:
+    global _redis_available, _redis_last_check
+    now = time.monotonic()
+    if _redis_available is not None and (now - _redis_last_check) < _REDIS_RECHECK_INTERVAL:
+        return _redis_available
+    try:
+        import redis.asyncio as aioredis
+        from redis.asyncio.connection import SSLConnection
+        pool = aioredis.ConnectionPool(
+            connection_class=SSLConnection,
+            host=os.environ.get("REDIS_HOST", ""),
+            port=int(os.environ.get("REDIS_PORT", 6379)),
+            password=os.environ.get("REDIS_AUTH", ""),
+            ssl_cert_reqs="none",
+            ssl_check_hostname=False,
+            socket_connect_timeout=3,
+        )
+        r = aioredis.Redis(connection_pool=pool)
+        await r.ping()
+        await r.aclose()
+        if _redis_available is not True:
+            log.info("redis_available")
+        _redis_available = True
+    except Exception as exc:
+        if _redis_available is not False:
+            log.warning("redis_unavailable", error=str(exc)[:80])
+        _redis_available = False
+    _redis_last_check = now
+    return _redis_available
 
 app = FastAPI(
     title="zHeight Architectural Intelligence API",
@@ -65,8 +104,6 @@ async def auth_and_request_id(request: Request, call_next):
 @app.get("/v1/health")
 async def health():
     from sqlalchemy import text
-    import sys; sys.path.insert(0, "/app")
-    from shared.db.client import get_db
 
     checks = {"service": "rag-api", "status": "ok", "version": "3.1.0"}
 
@@ -80,24 +117,7 @@ async def health():
         checks["db"] = f"error: {str(exc)[:80]}"
         checks["status"] = "degraded"
 
-    try:
-        import redis.asyncio as aioredis
-        from redis.asyncio.connection import SSLConnection
-        pool = aioredis.ConnectionPool(
-            connection_class=SSLConnection,
-            host=os.environ.get("REDIS_HOST", ""),
-            port=int(os.environ.get("REDIS_PORT", 6379)),
-            password=os.environ.get("REDIS_AUTH", ""),
-            ssl_cert_reqs="none",
-            ssl_check_hostname=False,
-            socket_connect_timeout=3,
-        )
-        r = aioredis.Redis(connection_pool=pool)
-        await r.ping()
-        await r.aclose()
-        checks["redis"] = "ok"
-    except Exception as exc:
-        checks["redis"] = f"degraded: {str(exc)[:60]}"
+    checks["redis"] = "ok" if await _check_redis() else "degraded"
 
     return checks
 

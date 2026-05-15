@@ -16,9 +16,9 @@ Fixed vs Phase 3 draft:
 - Auth uses RAG_API_KEY (matches existing rag-api-key secret)
 """
 from __future__ import annotations
-import asyncio, json, os, re, time, uuid
+import asyncio, json, math, os, re, time, uuid
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
@@ -28,6 +28,26 @@ from ..core.action_compiler import compile_to_plan
 
 log = structlog.get_logger()
 router = APIRouter(prefix="/orchestrate", tags=["orchestrate"])
+
+# VALIDATION-FIX: CHECK-E05 — in-process per-IP rate limiter (10 req/min)
+# Uses token-bucket approximation stored in module-level dict; safe for single-instance Cloud Run.
+# For multi-instance: replace with Redis-backed counter (key: f"ratelimit:{ip}", TTL 60s).
+_rate_buckets: dict[str, list[float]] = {}
+_RATE_LIMIT      = 10   # requests
+_RATE_WINDOW_SEC = 60.0 # per minute
+
+
+def _check_rate_limit(ip: str) -> None:
+    now = time.monotonic()
+    window = _rate_buckets.get(ip, [])
+    window = [t for t in window if now - t < _RATE_WINDOW_SEC]
+    if len(window) >= _RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: {_RATE_LIMIT} requests per minute per IP",
+        )
+    window.append(now)
+    _rate_buckets[ip] = window
 
 _client = None
 _client_lock = asyncio.Lock()
@@ -40,21 +60,91 @@ Be inclusive: accept any building type, any language mix.
 """
 
 GEN_SYSTEM = """
-You are a licensed US architect generating production-ready floor plan data.
-Your output drives a CAD layout engine that places rooms by TYPE — not by position hints.
-The engine uses standard US dimensions for each room type automatically.
+You are a licensed US residential architect and the PRIMARY SPATIAL INTELLIGENCE ENGINE.
+You make ALL architectural decisions. A deterministic CAD geometry executor translates
+your spatial intent into drawings — it cannot reason, it can only execute.
 
-YOUR ONLY JOB: produce the correct room LIST with correct TYPE values and realistic AREAS.
-The layout engine handles all positioning, adjacency, and circulation automatically.
+YOUR ROLE: architectural planner. The engine's role: geometric executor.
+
+YOU MUST PRODUCE 10 DIMENSIONS OF ARCHITECTURAL INTELLIGENCE:
+
+1. SPATIAL ZONING
+   Organise every plan into clear zones:
+   PUBLIC   → entry, foyer, living, dining, kitchen, powder_room
+   PRIVATE  → bedrooms, bathrooms, walk_in_closet (suite cluster at REAR of lot)
+   SERVICE  → laundry, mudroom, garage, pantry
+   Note: do NOT include hallway/corridor — the engine generates circulation automatically.
+
+2. CIRCULATION SEQUENCE
+   Define movement hierarchy from street to most private.
+   Typical CA suburban: Entry → Foyer → Open Living → Dining → Outdoor Connection
+                        Entry → Hallway → Bedroom Wing → Primary Suite (at rear)
+
+3. VIEW AXES
+   Establish dominant visual axes:
+   - Entry focal point (what you see when entering)
+   - Kitchen island sightline to living/outdoor
+   - Primary bedroom backyard orientation
+
+4. SOLAR ORIENTATION REASONING
+   - Living, dining, kitchen → south-facing light (productive all day)
+   - Primary bedroom → east-facing (morning light, privacy from street)
+   - Service zones → north or west (reduce cooling load)
+   - Minimise west glazing in bedrooms (summer heat gain)
+
+5. PRIVACY HIERARCHY — required on every space
+   "public"      → entry, living, dining, kitchen
+   "semi_private" → guest_bedroom, powder_room
+   "private"     → primary_bedroom, primary_bath, walk_in_closet, bathroom
+   "service"     → laundry, garage, mudroom, pantry
+
+6. ACOUSTIC BUFFERING
+   Bedrooms require separation from garage, foyer, and great room.
+   Express as noise_buffer_from list on each bedroom space.
+
+7. OUTDOOR CONNECTIONS
+   Living and dining connect to backyard/patio via adjacency.
+   Primary bedroom may reference backyard for private outdoor access.
+
+8. ADJACENCY GRAPH — required on every space
+   "connected_to"   → rooms directly accessible through a shared door
+   "near"           → rooms spatially adjacent but not directly connected
+   "separated_from" → rooms requiring acoustic or visual separation
+
+9. ORGANISATION TYPE — select the one that best fits the brief and lot:
+   "ranch"             → wide single-storey, 2.5:1 W:D, sequential front-to-back
+   "split_wing"        → Y-shaped, open living core, diverging bedroom and service wings
+   "open_plan_suburban"→ open core, private wing laterally offset by hallway
+   "courtyard"         → rooms around a central outdoor court
+   "spine"             → compact, rooms either side of a central corridor
+   "compact_urban"     → tight 0.8:1 footprint, efficiency-first
+
+10. WING ORIENTATION — which side the bedroom wing occupies on the X axis:
+    "living_left"  → living faces front-left, bedrooms right (default CA suburban)
+    "living_right" → living faces front-right (narrow east-facing lots)
+    In BOTH cases: bedrooms must be farthest from street entry (rear of lot in Y axis).
+
+PRIMARY SUITE STRATEGY (mandatory):
+- primary_bedroom placed at REAR of bedroom wing (highest Y — farthest from street)
+- Suite cluster = primary_bedroom + primary_bath + walk_in_closet (all in zone "rear")
+- connected_to must include: primary_bath, walk_in_closet
+- separated_from must include: garage, entry, great_room, foyer
+
+GARAGE PLACEMENT — add as variation-level field "garage_placement":
+- "front" → front-loaded driveway, garage near street face (default CA suburban with garage)
+- "rear"  → alley-loaded, garage at back of service zone
 
 OUTPUT RULES (non-negotiable):
 1. Valid JSON only. No markdown. No explanation. No comments.
-2. Generate exactly 3 variations. Each must have a distinct organisation_strategy.
-3. Every space MUST have the correct "type" from the approved list below.
+2. Generate exactly 3 variations. Each must have a distinct organisation_type.
+3. Every space MUST have the correct "type" from the approved list.
 4. area_sqm must be realistic (not too small, not too large).
-5. Do NOT invent zones — use exactly: "front", "centre", "rear", "service".
-6. Do NOT add hallway, corridor, or circulation spaces — the engine adds them.
-7. Do NOT add outdoor spaces (backyard, garden, yard, lawn, driveway) — computed automatically.
+5. Use key "zones" at the variation level — NEVER "spaces" at variation level.
+6. Every space must include: privacy_level, adjacency object, has_natural_light.
+7. primary_bedroom MUST be in zone_position "rear" (private, rear of lot).
+8. powder_room MUST be in zone_position "front" (guest-accessible, near entry).
+9. Do NOT include hallway, corridor, backyard, yard, garden — engine-computed.
+10. Each variation must differ in organisation_type (not just room sizes).
 
 APPROVED ROOM TYPES (use EXACTLY these strings — the engine matches on type):
 
@@ -117,6 +207,23 @@ US RESIDENTIAL ZONE ASSIGNMENT:
   zone_position "centre"  → kitchen + dining + living (ALL THREE, ONE zone) + enclair/sunroom if requested
   zone_position "rear"    → all bedrooms, baths, walk_in_closet
   zone_position "service" → laundry, mudroom, garage, pantry
+
+SCHEMA KEY REQUIREMENT — CRITICAL:
+- Use key "zones" at the variation level. NEVER use "spaces" at the variation level.
+- "spaces" is only valid INSIDE each zone object (the list of rooms within a zone).
+- Any example or training data that shows "spaces" at variation level is WRONG — convert it.
+
+REQUIRED SPACE METADATA — every space object inside zones must include:
+  "natural_light": true | false
+  "privacy_level": "public" | "semi_private" | "private" | "service"
+  "adjacency": ["type_or_zone_name", ...]
+
+ADJACENCY RULES — enforce in every variation:
+- kitchen must list dining or living in its adjacency
+- primary_bedroom must list primary_bath and walk_in_closet in adjacency
+- powder_room must be in zone_position "front", adjacent to entry
+- bedroom wing (zone_position "rear") must NOT directly connect to street/entry
+- Every zone must be reachable via valid adjacency graph — no disconnected zones
 """
 
 INTENT_SCHEMA = """{
@@ -170,8 +277,85 @@ class PluginRequest(BaseModel):
     autocad_units:           str = "mm"
 
 
+def _format_rag_precedent(projects: list[dict]) -> str:
+    """Serialize retrieved KB projects into rich spatial precedent descriptions."""
+    if not projects:
+        return "No KB references — generate from first principles."
+
+    lines = ["PRECEDENT SPATIAL PATTERNS (use as reasoning references, NOT templates to copy):"]
+    for i, r in enumerate(projects[:3], 1):
+        sc = r.get("site_context") or {}
+        if isinstance(sc, str):
+            try: sc = json.loads(sc)
+            except Exception: sc = {}
+        di = r.get("design_intent") or {}
+        if isinstance(di, str):
+            try: di = json.loads(di)
+            except Exception: di = {}
+        tags = r.get("domain_tags") or []
+        if isinstance(tags, str):
+            try: tags = json.loads(tags)
+            except Exception: tags = [tags]
+
+        lines.append(
+            f"\nPRECEDENT {i} — {r.get('project_name', 'Reference Project')} "
+            f"(match score: {r.get('composite_score', 0):.2f})"
+        )
+        lines.append(
+            f"  PROJECT SUMMARY: {r.get('project_category','?')}/{r.get('project_sub_type','?')} | "
+            f"{r.get('total_built_area_sqm','?')} sqm built | "
+            f"{r.get('floor_count', 1)} floor(s) | "
+            f"style: {di.get('style') or '?'} | "
+            f"tags: {', '.join(str(t) for t in tags) if tags else 'none'}"
+        )
+
+        plot_w = sc.get("plot_width_m") or sc.get("plot_w_m")
+        plot_d = sc.get("plot_depth_m") or sc.get("plot_d_m")
+        plot_area = sc.get("plot_area_sqm")
+        north = sc.get("north_direction") or sc.get("north")
+        climate = sc.get("climate_zone")
+        if plot_w or plot_d or plot_area or north or climate:
+            dim_str = (f"{plot_w}m × {plot_d}m" if plot_w and plot_d
+                       else f"{plot_area} sqm" if plot_area else "unknown dimensions")
+            lines.append(
+                f"  LOT CONTEXT: {dim_str} | "
+                f"north: {north or 'unknown'} | climate: {climate or 'unknown'}"
+            )
+
+        org = (di.get("organisation_type") or di.get("organisation_strategy")
+               or r.get("organisation_type"))
+        wing = di.get("wing_orientation") or r.get("wing_orientation")
+        if org or wing:
+            lines.append(f"  ORGANISATION: type={org or '?'} | wing_orientation={wing or '?'}")
+
+        for field, label in [
+            ("design_philosophy", "DESIGN INTENT"),
+            ("circulation_sequence", "CIRCULATION"),
+            ("solar_strategy", "SOLAR STRATEGY"),
+            ("entry_experience", "ENTRY EXPERIENCE"),
+            ("view_axes", "VIEW AXES"),
+            ("privacy_strategy", "PRIVACY STRATEGY"),
+            ("spatial_patterns", "SPATIAL PATTERNS"),
+        ]:
+            val = di.get(field) or r.get(field)
+            if val:
+                lines.append(f"  {label}: {str(val)[:250]}")
+
+    lines.append(
+        "\nINSTRUCTION: Use these precedents to inform spatial reasoning — "
+        "organisation_type choice, wing_orientation, circulation hierarchy, "
+        "solar strategy, and adjacency decisions. Do NOT copy room areas or "
+        "layouts directly. Adapt the spatial intelligence to the current brief."
+    )
+    return "\n".join(lines)
+
+
 @router.post("")
-async def orchestrate(req: PluginRequest):
+async def orchestrate(request: Request, req: PluginRequest):
+    # VALIDATION-FIX: CHECK-E05 — enforce rate limit before any AI work
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+
     request_id = str(uuid.uuid4())
     t0 = time.perf_counter()
 
@@ -235,12 +419,7 @@ async def orchestrate(req: PluginRequest):
     references = retrieval.get("projects", [])
 
     # ── 3. Build generation context ───────────────────────────────────────────
-    ref_ctx = "\n".join(
-        f"Ref {i+1} (score {r.get('composite_score',0):.2f}): "
-        f"{r.get('project_category')}/{r.get('project_sub_type')} "
-        f"{r.get('total_built_area_sqm')} sqm tags:{r.get('domain_tags')}"
-        for i, r in enumerate(references[:3])
-    ) or "No KB references — generate from first principles."
+    ref_ctx = _format_rag_precedent(references)
 
     spaces_ctx = ""
     if intent.get("spaces_requested"):
@@ -272,49 +451,54 @@ Generate exactly 3 layout variations. Output this JSON structure exactly:
       "concept_name": "Classic Ranch",
       "concept_rationale": "Single-storey linear plan with open great room facing backyard",
       "total_area_sqm": {area_sqm or 150},
-      "organisation_strategy": "linear",
+      "organisation_strategy": "residential",
+      "organisation_type": "ranch",
+      "wing_orientation": "living_left",
+      "circulation_sequence": "Entry → Foyer → Open Living/Kitchen → Dining → Backyard",
+      "solar_strategy": "South-facing living and kitchen for all-day light; east-facing primary suite for morning privacy",
+      "garage_placement": "front",
       "structural_grid_m": 4.0,
       "zones": [
         {{
           "zone_name": "front",
           "zone_position": "front",
           "spaces": [
-            {{"name": "Entry", "type": "entry", "area_sqm": 4.5, "floor": 1, "has_natural_light": true}},
-            {{"name": "Powder Room", "type": "powder_room", "area_sqm": 1.7, "floor": 1, "has_natural_light": false}}
+            {{"name": "Entry", "type": "entry", "area_sqm": 4.5, "floor": 1, "has_natural_light": true, "privacy_level": "public", "adjacency": {{"connected_to": ["living", "foyer"], "near": ["powder_room"], "separated_from": []}}}},
+            {{"name": "Powder Room", "type": "powder_room", "area_sqm": 1.7, "floor": 1, "has_natural_light": false, "privacy_level": "semi_private", "adjacency": {{"connected_to": ["entry"], "near": ["living"], "separated_from": ["primary_bedroom"]}}}}
           ]
         }},
         {{
           "zone_name": "centre",
           "zone_position": "centre",
           "spaces": [
-            {{"name": "Kitchen", "type": "kitchen", "area_sqm": 11.0, "floor": 1, "has_natural_light": true}},
-            {{"name": "Dining Room", "type": "dining", "area_sqm": 11.0, "floor": 1, "has_natural_light": true}},
-            {{"name": "Family Room", "type": "living", "area_sqm": 23.0, "floor": 1, "has_natural_light": true}}
+            {{"name": "Kitchen", "type": "kitchen", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "public", "adjacency": {{"connected_to": ["dining", "living"], "near": ["laundry"], "separated_from": []}}}},
+            {{"name": "Dining Room", "type": "dining", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "public", "adjacency": {{"connected_to": ["kitchen", "living"], "near": [], "separated_from": []}}}},
+            {{"name": "Family Room", "type": "living", "area_sqm": 23.0, "floor": 1, "has_natural_light": true, "privacy_level": "public", "adjacency": {{"connected_to": ["kitchen", "dining", "entry"], "near": [], "separated_from": []}}}}
           ]
         }},
         {{
           "zone_name": "rear",
           "zone_position": "rear",
           "spaces": [
-            {{"name": "Primary Suite", "type": "primary_bedroom", "area_sqm": 18.0, "floor": 1, "has_natural_light": true}},
-            {{"name": "Walk-In Closet", "type": "walk_in_closet", "area_sqm": 4.5, "floor": 1, "has_natural_light": false}},
-            {{"name": "Primary Bath", "type": "primary_bath", "area_sqm": 4.5, "floor": 1, "has_natural_light": false}},
-            {{"name": "Bedroom 2", "type": "secondary_bedroom", "area_sqm": 11.0, "floor": 1, "has_natural_light": true}},
-            {{"name": "Bedroom 3", "type": "secondary_bedroom", "area_sqm": 11.0, "floor": 1, "has_natural_light": true}},
-            {{"name": "Bath 2", "type": "bathroom", "area_sqm": 3.7, "floor": 1, "has_natural_light": false}}
+            {{"name": "Bedroom 2", "type": "secondary_bedroom", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "private", "adjacency": {{"connected_to": ["bathroom"], "near": ["hallway"], "separated_from": ["garage", "entry"]}}}},
+            {{"name": "Bedroom 3", "type": "secondary_bedroom", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "private", "adjacency": {{"connected_to": ["bathroom"], "near": ["hallway"], "separated_from": ["garage", "entry"]}}}},
+            {{"name": "Bath 2", "type": "bathroom", "area_sqm": 3.7, "floor": 1, "has_natural_light": false, "privacy_level": "private", "adjacency": {{"connected_to": ["secondary_bedroom"], "near": [], "separated_from": []}}}},
+            {{"name": "Primary Suite", "type": "primary_bedroom", "area_sqm": 18.0, "floor": 1, "has_natural_light": true, "privacy_level": "private", "adjacency": {{"connected_to": ["primary_bath", "walk_in_closet"], "near": [], "separated_from": ["garage", "entry", "great_room", "foyer"]}}}},
+            {{"name": "Walk-In Closet", "type": "walk_in_closet", "area_sqm": 4.5, "floor": 1, "has_natural_light": false, "privacy_level": "private", "adjacency": {{"connected_to": ["primary_bedroom"], "near": [], "separated_from": []}}}},
+            {{"name": "Primary Bath", "type": "primary_bath", "area_sqm": 4.5, "floor": 1, "has_natural_light": false, "privacy_level": "private", "adjacency": {{"connected_to": ["primary_bedroom"], "near": [], "separated_from": []}}}}
           ]
         }},
         {{
           "zone_name": "service",
           "zone_position": "service",
           "spaces": [
-            {{"name": "Laundry Room", "type": "laundry", "area_sqm": 4.5, "floor": 1, "has_natural_light": false}},
-            {{"name": "Mudroom", "type": "mudroom", "area_sqm": 4.5, "floor": 1, "has_natural_light": false}}
+            {{"name": "Laundry Room", "type": "laundry", "area_sqm": 4.5, "floor": 1, "has_natural_light": false, "privacy_level": "service", "adjacency": {{"connected_to": [], "near": ["kitchen"], "separated_from": []}}}},
+            {{"name": "Mudroom", "type": "mudroom", "area_sqm": 4.5, "floor": 1, "has_natural_light": false, "privacy_level": "service", "adjacency": {{"connected_to": ["garage"], "near": ["entry"], "separated_from": []}}}}
           ]
         }}
       ],
       "constraint_compliance": {{"far_used": 0.25, "height_m": 3.0, "coverage_pct": 30}},
-      "passive_notes": "South-facing living area maximizes daylight",
+      "passive_notes": "South-facing living area maximizes daylight; east-facing primary suite for morning light",
       "warnings": []
     }}
   ],
@@ -330,9 +514,24 @@ INSTRUCTIONS:
    enclair, sunroom, covered_porch, laundry, mudroom, garage, pantry.
 4. Kitchen + dining + living MUST be in ONE zone with zone_position "centre".
 5. Do NOT add hallway, corridor, backyard, yard, garden, or any outdoor space.
-6. Variation 2: use organisation_strategy "open_plan" — larger open living, fewer walls.
-7. Variation 3: use organisation_strategy "spine" — more compact, efficient layout.
-8. Each variation should adjust room count and sizes to reflect the brief."""
+6. Variation 2: use organisation_type "split_wing", organisation_strategy "open_plan" —
+   larger open living, consider "living_right" wing_orientation if solar context suits it.
+7. Variation 3: use organisation_type "compact_urban", organisation_strategy "spine" —
+   tight footprint, efficiency-first, compact bedroom wing.
+8. Each variation should adjust room count and sizes to reflect the brief.
+9. MANDATORY — use key "zones" (NOT "spaces") at the variation level. The layout engine
+   will FAIL SILENTLY if you emit "spaces" instead of "zones" at variation level.
+10. Each variation MUST include these variation-level fields: organisation_type (one of:
+    ranch/split_wing/open_plan_suburban/courtyard/spine/compact_urban), wing_orientation
+    ("living_left" or "living_right"), circulation_sequence (movement sequence string),
+    solar_strategy (orientation strategy string). Include garage_placement ("front" or
+    "rear") when a garage is present.
+11. Every space MUST include "privacy_level" ("public"/"semi_private"/"private"/"service")
+    and "adjacency" object with "connected_to", "near", "separated_from" lists.
+12. In zone "rear": secondary bedrooms FIRST (near street / low Y), primary suite LAST
+    (deepest into lot — rear privacy corner). The layout engine places them in list order.
+13. Use the precedent patterns above to justify organisation_type and wing_orientation
+    choices — adapt spatial intelligence to this brief, do not copy areas or layouts."""
 
     # ── 4. Generate ───────────────────────────────────────────────────────────
     for attempt in range(1, 3):
@@ -383,12 +582,11 @@ INSTRUCTIONS:
     # Also try parsing from prompt directly — but ONLY if "lot/site/plot" appears nearby,
     # to avoid treating house area ("2,500 sqft house") as lot size.
     if not site_area_sqm:
-        import re as _re
         # Require "lot", "site", "plot", or "land" within 60 chars of the sqft figure
-        m = _re.search(
+        m = re.search(
             r'(?:lot|site|plot|land|property)[^.]{0,60}?(\d[\d,]*)\s*(?:sqft|sq\.?\s*ft)'
             r'|(\d[\d,]*)\s*(?:sqft|sq\.?\s*ft)[^.]{0,60}?(?:lot|site|plot|land|property)',
-            req.prompt, _re.I)
+            req.prompt, re.I)
         if m:
             raw_num = (m.group(1) or m.group(2)).replace(",", "")
             site_area_sqm = float(raw_num) / 10.764
@@ -396,8 +594,7 @@ INSTRUCTIONS:
     if site_area_sqm and site_area_sqm > 50:
         # Estimate plot dimensions: assume 2:1 depth:width ratio (US suburban standard,
         # e.g. 50ft wide × 100ft deep = 465 sqm typical suburban lot)
-        import math as _math
-        plot_w_m = _math.sqrt(site_area_sqm / 2.0)
+        plot_w_m = math.sqrt(site_area_sqm / 2.0)
         plot_d_m = site_area_sqm / plot_w_m
         generation["site_constraints"] = {
             "plot_width_mm":  round(plot_w_m * 1000),

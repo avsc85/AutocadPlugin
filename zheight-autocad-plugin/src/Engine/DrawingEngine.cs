@@ -30,6 +30,13 @@ namespace zHeight.Plugin.Engine
         // Fix #8: instance field wired from ZHeightCommand via SetSiteConstraints()
         private SiteConstraints _siteConstraints = new SiteConstraints();
 
+        // D-01: cache which layers have been created; avoids redundant UpgradeOpen() per variation
+        private static readonly HashSet<string> _createdLayers =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        // D-01: cache dim style ObjectId across variations so we never re-query DimStyleTable
+        private static ObjectId _dimStyleId = ObjectId.Null;
+
         private const double VariationGapMm     = 12000;
         private const double FLOOR_SEPARATION_MM = 2000; // gap between floor plans (fix #11)
 
@@ -107,20 +114,37 @@ namespace zHeight.Plugin.Engine
         private void DrawVariation(VariationPlan variation, Point3d offset)
         {
             LayoutResult? layout = null;
-            if (variation.Properties?.ContainsKey("zones_json") == true)
+            bool hasZones = variation.Layout?.Zones?.Count > 0
+                         || variation.Properties?.ContainsKey("zones_json") == true;
+            if (hasZones)
             {
                 try
                 {
-                    // Override site constraints if backend sent lot dimensions
-                    if (variation.Properties.TryGetValue("site_constraints", out var scRaw))
+                    // F-01: prefer typed Layout site constraints; fall back to Properties JSON
+                    var typedSite = variation.Layout?.SiteConstraints;
+                    if (typedSite != null)
+                    {
+                        _siteConstraints = new SiteConstraints
+                        {
+                            PlotWidthMm  = typedSite.PlotWidthMm  ?? _siteConstraints.PlotWidthMm,
+                            PlotDepthMm  = typedSite.PlotDepthMm  ?? _siteConstraints.PlotDepthMm,
+                            FrontSetback = typedSite.FrontSetbackMm ?? _siteConstraints.FrontSetback,
+                            SideSetback  = typedSite.SideSetbackMm  ?? _siteConstraints.SideSetback,
+                            RearSetback  = typedSite.RearSetbackMm  ?? _siteConstraints.RearSetback,
+                        };
+                        _ed.WriteMessage(
+                            $"\n[zHeight] Site: {_siteConstraints.PlotWidthMm/1000:F1}m × " +
+                            $"{_siteConstraints.PlotDepthMm/1000:F1}m lot");
+                    }
+                    else if (variation.Properties?.TryGetValue("site_constraints", out var scRaw) == true)
                     {
                         try
                         {
                             var sc = JObject.Parse(scRaw?.ToString() ?? "{}");
                             _siteConstraints = new SiteConstraints
                             {
-                                PlotWidthMm  = sc["plot_width_mm"]?.Value<double>()  ?? _siteConstraints.PlotWidthMm,
-                                PlotDepthMm  = sc["plot_depth_mm"]?.Value<double>()  ?? _siteConstraints.PlotDepthMm,
+                                PlotWidthMm  = sc["plot_width_mm"]?.Value<double>()    ?? _siteConstraints.PlotWidthMm,
+                                PlotDepthMm  = sc["plot_depth_mm"]?.Value<double>()    ?? _siteConstraints.PlotDepthMm,
                                 FrontSetback = sc["front_setback_mm"]?.Value<double>() ?? _siteConstraints.FrontSetback,
                                 SideSetback  = sc["side_setback_mm"]?.Value<double>()  ?? _siteConstraints.SideSetback,
                                 RearSetback  = sc["rear_setback_mm"]?.Value<double>()  ?? _siteConstraints.RearSetback,
@@ -133,12 +157,20 @@ namespace zHeight.Plugin.Engine
                     }
 
                     var zones = ParseZones(variation);
-                    string strat = variation.Properties
-                        .GetValueOrDefault("organisation_strategy", "linear")
-                        ?.ToString() ?? "linear";
-                    double gridM = 4.0;
-                    if (variation.Properties.TryGetValue("structural_grid_m", out var gv))
-                        gridM = Convert.ToDouble(gv);
+                    // F-01: prefer typed Layout fields; fall back to Properties dict
+                    string strat = variation.Layout?.OrganisationStrategy
+                        ?? variation.Properties?.GetValueOrDefault("organisation_strategy", "residential")?.ToString()
+                        ?? "residential";
+                    double gridM = variation.Layout?.StructuralGridM
+                        ?? (variation.Properties?.TryGetValue("structural_grid_m", out var gv) == true
+                            ? Convert.ToDouble(gv) : 4.0);
+
+                    string wingOrient = variation.Layout?.WingOrientation
+                        ?? variation.Properties?.GetValueOrDefault("wing_orientation", "living_left")?.ToString()
+                        ?? "living_left";
+                    string garagePlac = variation.Layout?.GaragePlacement
+                        ?? variation.Properties?.GetValueOrDefault("garage_placement", "rear")?.ToString()
+                        ?? "rear";
 
                     layout = GridLayoutEngine.Layout(
                         zones, strat,
@@ -147,7 +179,9 @@ namespace zHeight.Plugin.Engine
                         _siteConstraints.FrontSetback,
                         _siteConstraints.SideSetback,
                         _siteConstraints.RearSetback,
-                        gridM * 1000);
+                        gridM * 1000,
+                        wingOrient,
+                        garagePlac);
 
                     foreach (var w in layout.Warnings)
                         _ed.WriteMessage($"\n[zHeight LAYOUT] {w}");
@@ -210,7 +244,13 @@ namespace zHeight.Plugin.Engine
 
                         var wallKeys = new HashSet<string>();
                         var wallSegs = new List<(double x1, double y1, double x2, double y2)>();
+                        // Wall gaps: (isHorizontalWall, fixedCoordinate, gapStart, gapEnd) in mm
+                        var doorGaps = new List<(bool horiz, double wallCoord, double gapStart, double gapEnd)>();
+                        var winGaps  = new List<(bool horiz, double wallCoord, double gapStart, double gapEnd)>();
                         int roomsDrawn = 0;
+
+                        // MISSING-01: suppress shared walls between open-plan rooms
+                        var openPlanSuppress = ComputeOpenPlanSuppressKeys(floorGroup.ToList());
 
                         foreach (var room in floorGroup)
                         {
@@ -221,14 +261,19 @@ namespace zHeight.Plugin.Engine
 
                                 DrawRoomHatch(room, floorOffset, space, tr);
 
-                                AddWallSeg(wallKeys, wallSegs, room.X,     room.Y,   room.Right, room.Y);
-                                AddWallSeg(wallKeys, wallSegs, room.Right, room.Y,   room.Right, room.Top);
-                                AddWallSeg(wallKeys, wallSegs, room.Right, room.Top, room.X,     room.Top);
-                                AddWallSeg(wallKeys, wallSegs, room.X,     room.Top, room.X,     room.Y);
+                                AddWallSeg(wallKeys, wallSegs, room.X,     room.Y,   room.Right, room.Y,   openPlanSuppress);
+                                AddWallSeg(wallKeys, wallSegs, room.Right, room.Y,   room.Right, room.Top, openPlanSuppress);
+                                AddWallSeg(wallKeys, wallSegs, room.Right, room.Top, room.X,     room.Top, openPlanSuppress);
+                                AddWallSeg(wallKeys, wallSegs, room.X,     room.Top, room.X,     room.Y,   openPlanSuppress);
 
                                 if (!isCorridor)
+                                {
+                                    // Collect door gap BEFORE drawing so wall splitter can use it
+                                    var dg = CalcDoorGap(room);
+                                    if (dg.HasValue) doorGaps.Add(dg.Value);
                                     try { DrawDoorOnRoom(room, floorOffset, space, tr); }
                                     catch { /* door failure never blocks room */ }
+                                }
 
                                 string rt = (room.Type ?? "").ToLowerInvariant()
                                     .Replace('-','_').Replace(' ','_');
@@ -251,11 +296,19 @@ namespace zHeight.Plugin.Engine
                                     { /* door already drawn above */ }
 
                                 if (room.HasNaturalLight && !noWin)
+                                {
+                                    var wg = CalcWindowGap(room);
+                                    if (wg.HasValue) winGaps.Add(wg.Value);
                                     try { DrawWindowOnRoom(room, floorOffset, space, tr); }
                                     catch { /* window failure never blocks room */ }
+                                }
 
                                 try { DrawRoomLabel(room, floorOffset, space, tr); }
                                 catch { /* label failure never blocks room */ }
+
+                                // MISSING-05: schematic furniture
+                                try { DrawRoomFurniture(room, floorOffset, space, tr); }
+                                catch { /* furniture failure never blocks room */ }
 
                                 roomsDrawn++;
                             }
@@ -266,11 +319,31 @@ namespace zHeight.Plugin.Engine
                             }
                         }
 
-                        // Draw deduped wall segments
+                        // Draw deduped wall segments — split at door and window openings
+                        var allWallGaps = doorGaps.Concat(winGaps).ToList();
                         foreach (var (x1, y1, x2, y2) in wallSegs)
                         {
-                            try { DrawWallSegment(x1, y1, x2, y2, "A-WALL-INTR", floorOffset, space, tr); }
+                            try { DrawWallSegmentWithGaps(x1, y1, x2, y2, "A-WALL-INTR",
+                                      floorOffset, space, tr, allWallGaps); }
                             catch { /* wall seg failure is non-fatal */ }
+                        }
+
+                        // MISSING-04: corner cap squares close L/T junction gaps in double-line walls
+                        var cornerSet = new HashSet<string>();
+                        foreach (var room in floorGroup)
+                        {
+                            foreach (var (cx, cy) in new[]
+                            {
+                                (room.X,     room.Y),   (room.Right, room.Y),
+                                (room.Right, room.Top), (room.X,     room.Top)
+                            })
+                            {
+                                static long Rc(double v) => (long)Math.Round(v / 10.0) * 10;
+                                string ck = $"{Rc(cx)},{Rc(cy)}";
+                                if (cornerSet.Add(ck))
+                                    try { DrawCornerCap(cx, cy, floorOffset, space, tr); }
+                                    catch { /* non-fatal */ }
+                            }
                         }
 
                         _ed.WriteMessage(
@@ -290,6 +363,12 @@ namespace zHeight.Plugin.Engine
                             DrawVertDimChain(floorGroup.ToList(), chainXmm, floorOffset, space, tr);
                         }
                         catch (Exception ex) { _ed.WriteMessage($"\n[zHeight] DimChain skipped: {ex.Message}"); }
+
+                        // VALIDATION-FIX: CHECK-DQ02 — pass NorthAngleDeg so arrow rotates per variation
+                        try { DrawNorthArrowLayout(layout, floorOffset, space, tr, variation.NorthAngleDeg); }
+                        catch (Exception ex) { _ed.WriteMessage($"\n[zHeight] NorthArrow skipped: {ex.Message}"); }
+                        try { DrawScaleBarLayout(layout, floorOffset, space, tr); }
+                        catch (Exception ex) { _ed.WriteMessage($"\n[zHeight] ScaleBar skipped: {ex.Message}"); }
                     }
                 }
                 else
@@ -469,7 +548,8 @@ namespace zHeight.Plugin.Engine
 
         private static void AddWallSeg(
             HashSet<string> keys, List<(double, double, double, double)> segs,
-            double x1, double y1, double x2, double y2)
+            double x1, double y1, double x2, double y2,
+            HashSet<string>? suppress = null)
         {
             // Round to 10 mm to absorb floating-point jitter from grid snapping
             static long R(double v) => (long)Math.Round(v / 10.0) * 10;
@@ -477,13 +557,92 @@ namespace zHeight.Plugin.Engine
             string key = ax1 < ax2 || (ax1 == ax2 && ay1 <= ay2)
                 ? $"{ax1},{ay1}|{ax2},{ay2}"
                 : $"{ax2},{ay2}|{ax1},{ay1}";
+            if (suppress?.Contains(key) == true) return;
             if (keys.Add(key))
                 segs.Add((x1, y1, x2, y2));
         }
 
+        // MISSING-01: canonical wall key (same rounding as AddWallSeg)
+        private static string WallKey(double x1, double y1, double x2, double y2)
+        {
+            static long R(double v) => (long)Math.Round(v / 10.0) * 10;
+            var (ax1, ay1, ax2, ay2) = (R(x1), R(y1), R(x2), R(y2));
+            return ax1 < ax2 || (ax1 == ax2 && ay1 <= ay2)
+                ? $"{ax1},{ay1}|{ax2},{ay2}"
+                : $"{ax2},{ay2}|{ax1},{ay1}";
+        }
+
+        // MISSING-01: find all wall segments that sit between two open-plan rooms.
+        // These segments must be suppressed so the public zone reads as one open space.
+        private static HashSet<string> ComputeOpenPlanSuppressKeys(List<SpaceNode> rooms)
+        {
+            var suppress = new HashSet<string>();
+            var op = rooms.Where(r => r.IsOpenPlan).ToList();
+            const double tol = 50.0;
+
+            for (int a = 0; a < op.Count; a++)
+            for (int b = a + 1; b < op.Count; b++)
+            {
+                var ra = op[a]; var rb = op[b];
+
+                // Horizontal shared wall: ra.Top ≈ rb.Y (ra is below rb)
+                if (Math.Abs(ra.Top - rb.Y) < tol &&
+                    ra.X < rb.Right - tol && rb.X < ra.Right - tol)
+                {
+                    suppress.Add(WallKey(Math.Max(ra.X, rb.X), ra.Top,
+                                         Math.Min(ra.Right, rb.Right), ra.Top));
+                }
+                // Horizontal shared wall: rb.Top ≈ ra.Y (rb is below ra)
+                else if (Math.Abs(rb.Top - ra.Y) < tol &&
+                         ra.X < rb.Right - tol && rb.X < ra.Right - tol)
+                {
+                    suppress.Add(WallKey(Math.Max(ra.X, rb.X), ra.Y,
+                                         Math.Min(ra.Right, rb.Right), ra.Y));
+                }
+
+                // Vertical shared wall: ra.Right ≈ rb.X (ra is left of rb)
+                if (Math.Abs(ra.Right - rb.X) < tol &&
+                    ra.Y < rb.Top - tol && rb.Y < ra.Top - tol)
+                {
+                    suppress.Add(WallKey(ra.Right, Math.Max(ra.Y, rb.Y),
+                                         ra.Right, Math.Min(ra.Top, rb.Top)));
+                }
+                // Vertical shared wall: rb.Right ≈ ra.X (rb is left of ra)
+                else if (Math.Abs(rb.Right - ra.X) < tol &&
+                         ra.Y < rb.Top - tol && rb.Y < ra.Top - tol)
+                {
+                    suppress.Add(WallKey(ra.X, Math.Max(ra.Y, rb.Y),
+                                         ra.X, Math.Min(ra.Top, rb.Top)));
+                }
+            }
+            return suppress;
+        }
+
+        // Draw a double-line wall at true architectural thickness:
+        //   A-WALL-EXTR → 230 mm total (115 mm each side of centreline)
+        //   A-WALL-INTR → 150 mm total (75 mm each side)
         private void DrawWallSegment(double x1, double y1, double x2, double y2,
                                       string layer, Point3d offset,
                                       BlockTableRecord space, Transaction tr)
+        {
+            double ht  = layer == "A-WALL-EXTR" ? 115.0 : 75.0; // half-thickness in mm
+            double dx  = x2 - x1;
+            double dy  = y2 - y1;
+            double len = Math.Sqrt(dx * dx + dy * dy);
+            if (len < 1.0) return;
+
+            // Unit normal perpendicular to wall direction
+            double nx = -dy / len * ht;
+            double ny =  dx / len * ht;
+
+            DrawLineRaw(x1 + nx, y1 + ny, x2 + nx, y2 + ny, layer, offset, space, tr);
+            DrawLineRaw(x1 - nx, y1 - ny, x2 - nx, y2 - ny, layer, offset, space, tr);
+        }
+
+        // Raw single-line primitive (drawing-unit coordinates after mm scale)
+        private void DrawLineRaw(double x1, double y1, double x2, double y2,
+                                  string layer, Point3d offset,
+                                  BlockTableRecord space, Transaction tr)
         {
             var line = new Line(
                 new Point3d(x1 * _s + offset.X, y1 * _s + offset.Y, 0),
@@ -491,6 +650,105 @@ namespace zHeight.Plugin.Engine
             line.Layer = layer;
             space.AppendEntity(line);
             tr.AddNewlyCreatedDBObject(line, true);
+        }
+
+        // Returns the door opening gap for a room's primary door (all values in mm).
+        // horiz=true  → gap is on a horizontal wall (bottom or top of room)
+        // horiz=false → gap is on a vertical   wall (left or right of room)
+        // wallCoord   → the fixed coordinate of the wall (y for horiz, x for vert)
+        // gapStart/End → the extent of the opening along the wall's variable axis
+        private static (bool horiz, double wallCoord, double gapStart, double gapEnd)?
+            CalcDoorGap(SpaceNode room)
+        {
+            double dw = GetDoorWidth(room.Type);
+            double hw = room.WidthMm / 2;
+            double hd = room.DepthMm / 2;
+            switch (room.Facing)
+            {
+                case "south": return (true,  room.Y,     room.X + hw - dw / 2, room.X + hw + dw / 2);
+                case "north": return (true,  room.Top,   room.X + hw - dw / 2, room.X + hw + dw / 2);
+                case "east":  return (false, room.Right, room.Y + hd - dw / 2, room.Y + hd + dw / 2);
+                case "west":  return (false, room.X,     room.Y + hd - dw / 2, room.Y + hd + dw / 2);
+                default:      return (true,  room.Y,     room.X + hw - dw / 2, room.X + hw + dw / 2);
+            }
+        }
+
+        // Window opening gap — same coordinate system as CalcDoorGap (all mm).
+        // MISSING-03: uses SolarWall when set, otherwise falls back to Facing.
+        private static (bool horiz, double wallCoord, double gapStart, double gapEnd)?
+            CalcWindowGap(SpaceNode room)
+        {
+            double cx_mm = room.X + room.WidthMm / 2;
+            double cy_mm = room.Y + room.DepthMm / 2;
+            // Solar wall takes priority over spatial facing for window placement
+            string wall = string.IsNullOrEmpty(room.SolarWall) ? room.Facing : room.SolarWall;
+            double winW;
+            switch (wall)
+            {
+                case "north":
+                    winW = Math.Min(room.WidthMm * 0.5, 1800);
+                    return (true, room.Top,   cx_mm - winW / 2, cx_mm + winW / 2);
+                case "east":
+                    winW = Math.Min(room.DepthMm * 0.5, 1800);
+                    return (false, room.Right, cy_mm - winW / 2, cy_mm + winW / 2);
+                case "west":
+                    winW = Math.Min(room.DepthMm * 0.5, 1800);
+                    return (false, room.X,     cy_mm - winW / 2, cy_mm + winW / 2);
+                default: // south
+                    winW = Math.Min(room.WidthMm * 0.5, 1800);
+                    return (true, room.Y,     cx_mm - winW / 2, cx_mm + winW / 2);
+            }
+        }
+
+        // Draws a wall segment while leaving gaps at door opening positions.
+        // For non-gapped segments, delegates to DrawWallSegment (double-line).
+        private void DrawWallSegmentWithGaps(
+            double x1, double y1, double x2, double y2,
+            string layer, Point3d offset, BlockTableRecord space, Transaction tr,
+            List<(bool horiz, double wallCoord, double gapStart, double gapEnd)> gaps)
+        {
+            bool   isHoriz = Math.Abs(y2 - y1) < 1.0;
+            double coord   = isHoriz ? y1 : x1;
+            const double tol = 50; // mm matching tolerance
+
+            // Collect gaps that apply to this specific wall segment
+            var applicable = new List<(double start, double end)>();
+            foreach (var (gh, gwc, gs, ge) in gaps)
+            {
+                if (gh != isHoriz) continue;
+                if (Math.Abs(gwc - coord) > tol) continue;
+                double segStart = isHoriz ? x1 : y1;
+                double segEnd   = isHoriz ? x2 : y2;
+                if (ge < segStart + tol || gs > segEnd - tol) continue;
+                applicable.Add((Math.Max(gs, segStart), Math.Min(ge, segEnd)));
+            }
+
+            if (applicable.Count == 0)
+            {
+                DrawWallSegment(x1, y1, x2, y2, layer, offset, space, tr);
+                return;
+            }
+
+            applicable.Sort((a, b) => a.start.CompareTo(b.start));
+
+            double cur = isHoriz ? x1 : y1;
+            double end = isHoriz ? x2 : y2;
+
+            foreach (var (gs, ge) in applicable)
+            {
+                if (gs > cur + 10) // draw segment before this gap
+                {
+                    if (isHoriz) DrawWallSegment(cur, y1, gs, y2, layer, offset, space, tr);
+                    else         DrawWallSegment(x1, cur, x2, gs, layer, offset, space, tr);
+                }
+                cur = ge; // advance past the gap
+            }
+
+            if (end > cur + 10) // draw tail after last gap
+            {
+                if (isHoriz) DrawWallSegment(cur, y1, end, y2, layer, offset, space, tr);
+                else         DrawWallSegment(x1, cur, x2, end, layer, offset, space, tr);
+            }
         }
 
         // Fix #9: all door geometry calculated in mm, scaled ONCE at Point3d
@@ -557,13 +815,15 @@ namespace zHeight.Plugin.Engine
         private void DrawWindowOnRoom(SpaceNode room, Point3d offset,
                                        BlockTableRecord space, Transaction tr)
         {
+            // MISSING-03: use SolarWall when set (solar-aware placement) else Facing
+            string wall    = string.IsNullOrEmpty(room.SolarWall) ? room.Facing : room.SolarWall;
             double winW_mm = Math.Min(Math.Max(room.WidthMm, room.DepthMm) * 0.5, 1800);
             double cx_mm   = room.X + room.WidthMm / 2;
             double cy_mm   = room.Y + room.DepthMm / 2;
-            bool   horiz   = room.Facing is "south" or "north";
+            bool   horiz   = wall is "south" or "north";
 
             double wx_mm, wy_mm;
-            switch (room.Facing)
+            switch (wall)
             {
                 case "north": wx_mm = cx_mm - winW_mm / 2; wy_mm = room.Top;   break;
                 case "east":  winW_mm = Math.Min(room.DepthMm * 0.5, 1800);
@@ -594,6 +854,225 @@ namespace zHeight.Plugin.Engine
                 line.Layer = "A-GLAZ";
                 space.AppendEntity(line);
                 tr.AddNewlyCreatedDBObject(line, true);
+            }
+        }
+
+        // ── MISSING-04: corner cap — fills the pocket gap at L/T/cross junctions ──
+        private void DrawCornerCap(double cx, double cy, Point3d offset,
+            BlockTableRecord space, Transaction tr)
+        {
+            const double ht = 75.0; // half internal-wall thickness (mm)
+            double x1 = (cx - ht) * _s + offset.X;
+            double x2 = (cx + ht) * _s + offset.X;
+            double y1 = (cy - ht) * _s + offset.Y;
+            double y2 = (cy + ht) * _s + offset.Y;
+            var cap = new Polyline();
+            cap.AddVertexAt(0, new Point2d(x1, y1), 0, 0, 0);
+            cap.AddVertexAt(1, new Point2d(x2, y1), 0, 0, 0);
+            cap.AddVertexAt(2, new Point2d(x2, y2), 0, 0, 0);
+            cap.AddVertexAt(3, new Point2d(x1, y2), 0, 0, 0);
+            cap.Closed        = true;
+            cap.ConstantWidth = 0;
+            cap.Layer         = "A-WALL-INTR";
+            space.AppendEntity(cap);
+            tr.AddNewlyCreatedDBObject(cap, true);
+        }
+
+        // ── MISSING-05: schematic furniture ──────────────────────────────────────
+
+        private void DrawRoomFurniture(SpaceNode room, Point3d offset,
+            BlockTableRecord space, Transaction tr)
+        {
+            string rt = (room.Type ?? "").ToLowerInvariant().Replace('-', '_').Replace(' ', '_');
+            switch (rt)
+            {
+                case "living_room" or "living" or "great_room" or "family_room" or "open_living":
+                    DrawLivingFurniture(room, offset, space, tr); break;
+                case "dining_room" or "dining" or "kitchen_dining" or "breakfast_nook":
+                    DrawDiningFurniture(room, offset, space, tr); break;
+                case "kitchen" or "open_kitchen":
+                    DrawKitchenFurniture(room, offset, space, tr); break;
+                case "primary_bedroom" or "primary_suite" or "master_bedroom":
+                    DrawBedFurniture(room, offset, space, tr, king: true); break;
+                case "secondary_bedroom" or "bedroom" or "guest_bedroom" or "guest_room"
+                  or "home_office_bedroom" or "nursery":
+                    DrawBedFurniture(room, offset, space, tr, king: false); break;
+                case "bathroom" or "bath" or "primary_bath" or "ensuite_bath" or "ensuite"
+                  or "master_bath" or "secondary_bath" or "shared_bath" or "full_bath":
+                    DrawBathFurniture(room, offset, space, tr, full: true); break;
+                case "powder_room" or "half_bath" or "toilet":
+                    DrawBathFurniture(room, offset, space, tr, full: false); break;
+            }
+        }
+
+        // Draws a schematic rectangle on A-FURN layer (all coords in mm, room-relative origin)
+        private void DrawFurnRect(double rx, double ry, double rw, double rd,
+            Point3d offset, BlockTableRecord space, Transaction tr)
+        {
+            var pl = new Polyline();
+            pl.AddVertexAt(0, new Point2d(rx        * _s + offset.X, ry        * _s + offset.Y), 0, 0, 0);
+            pl.AddVertexAt(1, new Point2d((rx + rw) * _s + offset.X, ry        * _s + offset.Y), 0, 0, 0);
+            pl.AddVertexAt(2, new Point2d((rx + rw) * _s + offset.X, (ry + rd) * _s + offset.Y), 0, 0, 0);
+            pl.AddVertexAt(3, new Point2d(rx        * _s + offset.X, (ry + rd) * _s + offset.Y), 0, 0, 0);
+            pl.Closed        = true;
+            pl.ConstantWidth = 0;
+            pl.Layer         = "A-FURN";
+            space.AppendEntity(pl);
+            tr.AddNewlyCreatedDBObject(pl, true);
+        }
+
+        // Draws a schematic circle on A-FURN (chair seat, appliance symbol)
+        private void DrawFurnCircle(double cx, double cy, double r,
+            Point3d offset, BlockTableRecord space, Transaction tr)
+        {
+            var c = new Circle(
+                new Point3d(cx * _s + offset.X, cy * _s + offset.Y, 0),
+                Vector3d.ZAxis, r * _s);
+            c.Layer = "A-FURN";
+            space.AppendEntity(c);
+            tr.AddNewlyCreatedDBObject(c, true);
+        }
+
+        // Sofa + coffee table + TV-wall marker along the south wall of the living room
+        private void DrawLivingFurniture(SpaceNode room, Point3d offset,
+            BlockTableRecord space, Transaction tr)
+        {
+            const double clearance = 150.0; // mm clearance from walls
+            double sofaW = Math.Min(2500.0, room.WidthMm - 2 * clearance);
+            double sofaD = 900.0;
+            if (sofaW < 1200 || room.DepthMm < sofaD + 1200) return;
+
+            // Sofa: centred horizontally, placed near the south wall
+            double sofaX = room.X + (room.WidthMm - sofaW) / 2;
+            double sofaY = room.Y + clearance;
+            DrawFurnRect(sofaX, sofaY, sofaW, sofaD, offset, space, tr);
+
+            // Coffee table: centred in front of sofa
+            double ctW = Math.Min(1200.0, sofaW * 0.55);
+            double ctD = 600.0;
+            DrawFurnRect(sofaX + (sofaW - ctW) / 2, sofaY + sofaD + 300, ctW, ctD, offset, space, tr);
+
+            // TV wall indicator: thick line on the north wall, centred
+            double tvW = Math.Min(1600.0, room.WidthMm * 0.40);
+            double tvY = room.Top - clearance - 75;
+            DrawFurnRect(room.X + (room.WidthMm - tvW) / 2, tvY, tvW, 75, offset, space, tr);
+        }
+
+        // Dining table + 4 chairs (2 per long side)
+        private void DrawDiningFurniture(SpaceNode room, Point3d offset,
+            BlockTableRecord space, Transaction tr)
+        {
+            const double chairW = 460.0, chairD = 460.0;
+            double tableW = Math.Min(1200.0, room.WidthMm  - 800);
+            double tableD = Math.Min(900.0,  room.DepthMm  - 800);
+            if (tableW < 800 || tableD < 600) return;
+
+            // Table centred in room
+            double tx = room.X + (room.WidthMm - tableW) / 2;
+            double ty = room.Y + (room.DepthMm - tableD) / 2;
+            DrawFurnRect(tx, ty, tableW, tableD, offset, space, tr);
+
+            // 2 chairs on south side
+            double chairGap = tableW / 3;
+            for (int i = 0; i < 2; i++)
+                DrawFurnRect(tx + chairGap * (i + 0.25), ty - chairD - 150,
+                             chairW, chairD, offset, space, tr);
+            // 2 chairs on north side
+            for (int i = 0; i < 2; i++)
+                DrawFurnRect(tx + chairGap * (i + 0.25), ty + tableD + 150,
+                             chairW, chairD, offset, space, tr);
+        }
+
+        // Kitchen: perimeter counters (600 mm deep) + island if room is wide enough
+        private void DrawKitchenFurniture(SpaceNode room, Point3d offset,
+            BlockTableRecord space, Transaction tr)
+        {
+            const double counterD = 600.0;
+            const double clearance = 150.0;
+
+            // South counter (base cabinets along south wall)
+            DrawFurnRect(room.X + clearance, room.Y + clearance,
+                         room.WidthMm - 2 * clearance, counterD, offset, space, tr);
+
+            // East counter (if room deep enough)
+            if (room.DepthMm > 2400)
+                DrawFurnRect(room.Right - clearance - counterD, room.Y + clearance,
+                             counterD, room.DepthMm * 0.55, offset, space, tr);
+
+            // Sink symbol on south counter centre
+            double sinkX = room.X + room.WidthMm / 2 - 300;
+            DrawFurnCircle(sinkX + 200, room.Y + clearance + counterD * 0.5,
+                           150, offset, space, tr);
+
+            // Island: only if room is at least 3600 wide and 3000 deep
+            if (room.WidthMm >= 3600 && room.DepthMm >= 3000)
+            {
+                double islandW = Math.Min(1500.0, room.WidthMm - 2 * (counterD + 900));
+                double islandD = 900.0;
+                if (islandW >= 900)
+                {
+                    double islandX = room.X + (room.WidthMm - islandW) / 2;
+                    double islandY = room.Y + counterD + clearance + 1000;
+                    DrawFurnRect(islandX, islandY, islandW, islandD, offset, space, tr);
+                }
+            }
+        }
+
+        // Bed (king or queen) + 2 side tables, centred against the north wall
+        private void DrawBedFurniture(SpaceNode room, Point3d offset,
+            BlockTableRecord space, Transaction tr, bool king)
+        {
+            double bedW = king ? 1930.0 : 1524.0;
+            double bedD = king ? 2030.0 : 2032.0;
+            const double stW = 600.0, stD = 450.0; // side table
+            const double clearance = 200.0;
+
+            if (room.WidthMm < bedW + 2 * clearance || room.DepthMm < bedD + 600) return;
+
+            // Bed centred horizontally, placed near the north wall (top)
+            double bedX = room.X + (room.WidthMm - bedW) / 2;
+            double bedY = room.Top - clearance - bedD;
+            DrawFurnRect(bedX, bedY, bedW, bedD, offset, space, tr);
+
+            // Side tables flanking the bed (only if space allows)
+            if (bedX - room.X > stW + clearance)
+            {
+                DrawFurnRect(bedX - stW - 100, bedY + bedD - stD, stW, stD, offset, space, tr);
+                DrawFurnRect(bedX + bedW + 100, bedY + bedD - stD, stW, stD, offset, space, tr);
+            }
+        }
+
+        // Bathroom furniture: toilet + vanity + shower or tub
+        private void DrawBathFurniture(SpaceNode room, Point3d offset,
+            BlockTableRecord space, Transaction tr, bool full)
+        {
+            const double clearance = 150.0;
+            bool narrow = room.WidthMm < 1800;
+
+            // Toilet (460×700) in the corner farthest from door (north-east)
+            double toiletX = room.Right - clearance - 460;
+            double toiletY = room.Top   - clearance - 700;
+            DrawFurnRect(toiletX, toiletY, 460, 700, offset, space, tr);
+
+            // Vanity (900×500) along south wall
+            double vanW = Math.Min(900.0, room.WidthMm - 2 * clearance);
+            if (vanW >= 450)
+                DrawFurnRect(room.X + clearance, room.Y + clearance, vanW, 500, offset, space, tr);
+
+            if (!full) return;
+
+            // Shower or tub
+            if (room.DepthMm >= 2800 && room.WidthMm >= 2200)
+            {
+                // Tub (1525×760) along east wall
+                DrawFurnRect(room.Right - clearance - 760, room.Y + clearance,
+                             760, 1525, offset, space, tr);
+            }
+            else if (!narrow)
+            {
+                // Shower stall (900×900) in north-west corner
+                DrawFurnRect(room.X + clearance, room.Top - clearance - 900,
+                             900, 900, offset, space, tr);
             }
         }
 
@@ -677,11 +1156,21 @@ namespace zHeight.Plugin.Engine
                 hatch.Layer        = "A-WALL-PATT";
                 hatch.Associative  = false; // non-associative is more reliable cross-version
 
+                // Inset by 75mm (half of 150mm internal wall) so hatch fills net interior only
+                const double HatchInsetMm = 75.0;
+                double ins = HatchInsetMm * _s;
+                double hx1 = room.X     * _s + offset.X + ins;
+                double hx2 = room.Right * _s + offset.X - ins;
+                double hy1 = room.Y     * _s + offset.Y + ins;
+                double hy2 = room.Top   * _s + offset.Y - ins;
+                // Guard: skip hatch for rooms too small to have a net interior
+                if (hx2 - hx1 < 100 * _s || hy2 - hy1 < 100 * _s) return;
+
                 var boundary = new Polyline();
-                boundary.AddVertexAt(0, new Point2d(room.X     * _s + offset.X, room.Y   * _s + offset.Y), 0, 0, 0);
-                boundary.AddVertexAt(1, new Point2d(room.Right * _s + offset.X, room.Y   * _s + offset.Y), 0, 0, 0);
-                boundary.AddVertexAt(2, new Point2d(room.Right * _s + offset.X, room.Top * _s + offset.Y), 0, 0, 0);
-                boundary.AddVertexAt(3, new Point2d(room.X     * _s + offset.X, room.Top * _s + offset.Y), 0, 0, 0);
+                boundary.AddVertexAt(0, new Point2d(hx1, hy1), 0, 0, 0);
+                boundary.AddVertexAt(1, new Point2d(hx2, hy1), 0, 0, 0);
+                boundary.AddVertexAt(2, new Point2d(hx2, hy2), 0, 0, 0);
+                boundary.AddVertexAt(3, new Point2d(hx1, hy2), 0, 0, 0);
                 boundary.Closed = true;
                 boundary.Layer  = "A-WALL-PATT";
                 space.AppendEntity(boundary);
@@ -696,6 +1185,107 @@ namespace zHeight.Plugin.Engine
                 // Hatch is optional visual fill — never let it crash the drawing
                 _ed.WriteMessage($"\n[zHeight] Hatch skipped for {room.Name}: {ex.Message}");
             }
+        }
+
+        // Per-variation north arrow — positioned right of building, relative to this variation's offset
+        // VALIDATION-FIX: CHECK-DQ02 — north arrow rotated by northAngleDeg from variation plan
+        private void DrawNorthArrowLayout(LayoutResult layout, Point3d offset,
+                                          BlockTableRecord space, Transaction tr,
+                                          double northAngleDeg = 0.0)
+        {
+            double cx = (layout.BuildingX + layout.BuildingW + 2400) * _s + offset.X;
+            double cy = (layout.BuildingY + layout.BuildingD * 0.80) * _s + offset.Y;
+            double r  = 300 * _s;
+
+            // Rotate arrow direction by northAngleDeg (0° = up, clockwise positive per survey)
+            double rad = northAngleDeg * Math.PI / 180.0;
+            double dx  =  Math.Sin(rad) * r;
+            double dy  =  Math.Cos(rad) * r;
+
+            var circle = new Circle(new Point3d(cx, cy, 0), Vector3d.ZAxis, r);
+            circle.Layer = "A-ANNO-SYMB";
+            space.AppendEntity(circle); tr.AddNewlyCreatedDBObject(circle, true);
+
+            var arrow = new Line(
+                new Point3d(cx, cy, 0),
+                new Point3d(cx + dx, cy + dy, 0));
+            arrow.Layer = "A-ANNO-SYMB";
+            space.AppendEntity(arrow); tr.AddNewlyCreatedDBObject(arrow, true);
+
+            // "N" label at arrow tip
+            var nTxt = new DBText();
+            nTxt.Position   = new Point3d(cx + dx - 100 * _s, cy + dy + 80 * _s, 0);
+            nTxt.TextString = "N";
+            nTxt.Height     = 200 * _s;
+            nTxt.Layer      = "A-ANNO-SYMB";
+            space.AppendEntity(nTxt); tr.AddNewlyCreatedDBObject(nTxt, true);
+        }
+
+        // Per-variation scale bar — positioned below-right of building
+        // VALIDATION-FIX: CHECK-DQ03 — graduated 0-5-10m scale bar with mid-tick
+        private void DrawScaleBarLayout(LayoutResult layout, Point3d offset,
+                                        BlockTableRecord space, Transaction tr)
+        {
+            double x = (layout.BuildingX + layout.BuildingW + 1200) * _s + offset.X;
+            double y = (layout.BuildingY - 2400) * _s + offset.Y;
+            double halfBar = 5000 * _s;  // each half = 5m at 1:100
+            double barLen  = halfBar * 2; // total = 10m
+
+            // Full bar baseline
+            var bar = new Line(new Point3d(x, y, 0), new Point3d(x + barLen, y, 0));
+            bar.Layer = "A-ANNO-SYMB";
+            space.AppendEntity(bar); tr.AddNewlyCreatedDBObject(bar, true);
+
+            // End-ticks (tall) + mid-tick (short)
+            double tallTick  = 200 * _s;
+            double shortTick = 120 * _s;
+            foreach (var (px, h) in new[] {
+                (x,            tallTick),   // 0m
+                (x + halfBar,  shortTick),  // 5m
+                (x + barLen,   tallTick),   // 10m
+            })
+            {
+                var t = new Line(new Point3d(px, y - h, 0), new Point3d(px, y + h, 0));
+                t.Layer = "A-ANNO-SYMB";
+                space.AppendEntity(t); tr.AddNewlyCreatedDBObject(t, true);
+            }
+
+            // Hatch the first 5m segment for readability
+            double hh = 100 * _s;
+            var fill = new Polyline();
+            fill.AddVertexAt(0, new Point2d(x,           y),     0, 0, 0);
+            fill.AddVertexAt(1, new Point2d(x + halfBar, y),     0, 0, 0);
+            fill.AddVertexAt(2, new Point2d(x + halfBar, y + hh),0, 0, 0);
+            fill.AddVertexAt(3, new Point2d(x,           y + hh),0, 0, 0);
+            fill.Closed        = true;
+            fill.ConstantWidth = 0;
+            fill.Layer         = "A-ANNO-SYMB";
+            space.AppendEntity(fill); tr.AddNewlyCreatedDBObject(fill, true);
+
+            // Labels: 0, 5m, 10m
+            double th = 175 * _s;
+            double ty  = y - tallTick - th - 50 * _s;
+            foreach (var (px, lbl) in new[] {
+                (x,                   "0"),
+                (x + halfBar - th,    "5"),
+                (x + barLen - th * 2, "10m"),
+            })
+            {
+                var t = new DBText();
+                t.Position   = new Point3d(px, ty, 0);
+                t.TextString = lbl;
+                t.Height     = th;
+                t.Layer      = "A-ANNO-SYMB";
+                space.AppendEntity(t); tr.AddNewlyCreatedDBObject(t, true);
+            }
+
+            // Scale note
+            var note = new DBText();
+            note.Position   = new Point3d(x, y + tallTick + 50 * _s, 0);
+            note.TextString = "1:100";
+            note.Height     = th;
+            note.Layer      = "A-ANNO-SYMB";
+            space.AppendEntity(note); tr.AddNewlyCreatedDBObject(note, true);
         }
 
         private static bool IsEnclaireType(string rt) =>
@@ -749,7 +1339,7 @@ namespace zHeight.Plugin.Engine
             var entryTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "entry","foyer","entry_foyer","vestibule","front_entry" };
 
-            const double tol = 60; // mm snap tolerance for shared-wall detection
+            const double tol = 150; // mm snap tolerance — must tolerate 300mm grid rounding
 
             // ── 1. Bed ↔ Bath suite doors ─────────────────────────────────────
             var beds  = rooms.Where(r => bedTypes.Contains(r.Type)).ToList();
@@ -1047,35 +1637,63 @@ namespace zHeight.Plugin.Engine
         }
 
         // Fix #7: create all AIA layers directly — no separate helper needed
+        // VALIDATION-FIX: CHECK-DQ05 — added programmatic LineWeight to every layer entry
         private void EnsureStandardLayers(Transaction tr)
         {
-            var lt = (LayerTable)tr.GetObject(_db.LayerTableId, OpenMode.ForRead);
-
-            var layers = new (string name, short color)[]
+            var layers = new (string name, short color, LineWeight lw)[]
             {
-                ("A-WALL-EXTR", 7), ("A-WALL-INTR", 7), ("A-WALL-PRTN", 8),
-                ("A-DOOR",      4), ("A-DOOR-SWNG", 4), ("A-GLAZ",      4),
-                ("A-ANNO-TEXT", 2), ("A-AREA-IDEN", 6), ("A-ANNO-SYMB", 2),
-                ("A-ANNO-DIMS", 2), ("A-ANNO-TTLB", 7), ("A-WALL-PATT", 8),
-                ("C-PROP",      1), ("S-COLS",      7),  ("ZH-AI-NOTES", 150),
+                ("A-WALL-EXTR", 7, LineWeight.LineWeight035),  // exterior walls: heavy
+                ("A-WALL-INTR", 7, LineWeight.LineWeight025),  // interior walls: medium
+                ("A-WALL-PRTN", 8, LineWeight.LineWeight018),  // partitions: light
+                ("A-DOOR",      4, LineWeight.LineWeight018),
+                ("A-DOOR-SWNG", 4, LineWeight.LineWeight013),
+                ("A-GLAZ",      4, LineWeight.LineWeight013),
+                ("A-ANNO-TEXT", 2, LineWeight.LineWeight018),
+                ("A-AREA-IDEN", 6, LineWeight.LineWeight013),
+                ("A-ANNO-SYMB", 2, LineWeight.LineWeight013),
+                ("A-ANNO-DIMS", 2, LineWeight.LineWeight013),
+                ("A-ANNO-TTLB", 7, LineWeight.LineWeight035),  // title block: heavy
+                ("A-WALL-PATT", 8, LineWeight.LineWeight009),
+                ("C-PROP",      1, LineWeight.LineWeight050),  // property line: bold
+                ("S-COLS",      7, LineWeight.LineWeight035),
+                ("ZH-AI-NOTES",150,LineWeight.LineWeight013),
+                ("A-FURN",      3, LineWeight.LineWeight013),  // MISSING-05: schematic furniture
             };
 
-            foreach (var (name, color) in layers)
+            // D-01: skip the table open entirely if all layers are already cached
+            if (layers.All(l => _createdLayers.Contains(l.name)))
+                return;
+
+            var lt = (LayerTable)tr.GetObject(_db.LayerTableId, OpenMode.ForRead);
+            bool upgraded = false;
+
+            foreach (var (name, color, lw) in layers)
             {
-                if (lt.Has(name)) continue;
-                lt.UpgradeOpen();
+                if (_createdLayers.Contains(name) || lt.Has(name))
+                {
+                    _createdLayers.Add(name);
+                    continue;
+                }
+                if (!upgraded) { lt.UpgradeOpen(); upgraded = true; }
                 var ltr = new LayerTableRecord { Name = name };
-                ltr.Color = Autodesk.AutoCAD.Colors.Color.FromColorIndex(
+                ltr.Color      = Autodesk.AutoCAD.Colors.Color.FromColorIndex(
                     Autodesk.AutoCAD.Colors.ColorMethod.ByAci, color);
+                ltr.LineWeight = lw;
                 lt.Add(ltr);
                 tr.AddNewlyCreatedDBObject(ltr, true);
+                _createdLayers.Add(name);
             }
         }
 
-        // ── Zone parsing — reads from VariationPlan.Properties (fix #2) ───────
+        // ── Zone parsing — prefers typed Layout contract, falls back to zones_json ─
 
         private List<ZoneGroup> ParseZones(VariationPlan variation)
         {
+            // F-01: prefer typed Layout.Zones (no JSON parsing needed)
+            if (variation.Layout?.Zones?.Count > 0)
+                return ParseZonesFromContract(variation.Layout.Zones);
+
+            // legacy fallback: parse zones_json string from Properties dict
             var zones = new List<ZoneGroup>();
             if (!variation.Properties.TryGetValue("zones_json", out var raw))
                 return zones;
@@ -1120,6 +1738,38 @@ namespace zHeight.Plugin.Engine
                 _ed.WriteMessage($"\n[zHeight] Zone parse error: {ex.Message}");
             }
 
+            return zones;
+        }
+
+        private static List<ZoneGroup> ParseZonesFromContract(List<ZoneGroupContract> contracts)
+        {
+            var zones = new List<ZoneGroup>();
+            foreach (var zc in contracts)
+            {
+                var zone = new ZoneGroup
+                {
+                    ZoneName = zc.ZoneName,
+                    Position = zc.ZonePosition,
+                };
+                foreach (var sc in zc.Spaces)
+                {
+                    zone.Spaces.Add(new SpaceNode
+                    {
+                        Name            = sc.Name,
+                        Type            = sc.Type,
+                        AreaSqm         = sc.AreaSqm ?? 15.0,
+                        AspectRatio     = sc.AspectRatio ?? 1.4,
+                        Floor           = sc.Floor,
+                        Facing          = "south",
+                        HasNaturalLight = sc.HasNaturalLight,
+                        MinWidthM       = sc.MinWidthM ?? 2.4,
+                        MinDepthM       = sc.MinDepthM ?? 2.4,
+                        AdjacentTo      = new List<string>(),
+                        DoorConnects    = new List<string>(),
+                    });
+                }
+                zones.Add(zone);
+            }
             return zones;
         }
 
@@ -1176,8 +1826,8 @@ namespace zHeight.Plugin.Engine
                     break;
 
                 case ActionType.ADD_TITLE_BLOCK:
-                    if (a.Start != null && !string.IsNullOrEmpty(a.LabelText))
-                        DrawMText(a, offset, space, tr);
+                    // VALIDATION-FIX: CHECK-DQ01 — insert as block reference, not raw DBText
+                    DrawTitleBlockInsert(a, offset, space, tr);
                     break;
 
                 case ActionType.START_GROUP:
@@ -1283,16 +1933,159 @@ namespace zHeight.Plugin.Engine
             tr.AddNewlyCreatedDBObject(mt, true);
         }
 
+        // VALIDATION-FIX: CHECK-DQ01 — title block as BlockDefinition + BlockReference INSERT
+        private const string TitleBlockName = "ZHEIGHT-TITLE";
+
+        private void DrawTitleBlockInsert(DrawAction a, Point3d offset,
+                                          BlockTableRecord space, Transaction tr)
+        {
+            var pos = To3d(a.Start ?? a.Center ?? new Point2D { X = 0, Y = 0 }, offset);
+            string projectTitle = a.LabelText ?? "zHeight Project";
+
+            // Build block definition once per drawing session
+            var bt = (BlockTable)tr.GetObject(_db.BlockTableId, OpenMode.ForRead);
+            ObjectId blkId;
+
+            if (!bt.Has(TitleBlockName))
+            {
+                bt.UpgradeOpen();
+                var btr = new BlockTableRecord { Name = TitleBlockName, Origin = Point3d.Origin };
+                blkId = bt.Add(btr);
+                tr.AddNewlyCreatedDBObject(btr, true);
+                PopulateTitleBlockDef(btr, tr);
+            }
+            else
+            {
+                blkId = bt[TitleBlockName];
+            }
+
+            var bref = new BlockReference(pos, blkId);
+            bref.Layer = "A-ANNO-TTLB";
+            space.AppendEntity(bref);
+            tr.AddNewlyCreatedDBObject(bref, true);
+
+            // Stamp attribute values
+            var defBtr = (BlockTableRecord)tr.GetObject(blkId, OpenMode.ForRead);
+            foreach (ObjectId eid in defBtr)
+            {
+                if (!(tr.GetObject(eid, OpenMode.ForRead) is AttributeDefinition attDef) || attDef.Constant)
+                    continue;
+                var attRef = new AttributeReference();
+                attRef.SetAttributeFromBlock(attDef, bref.BlockTransform);
+                attRef.TextString = attDef.Tag switch
+                {
+                    "PROJECT_TITLE" => projectTitle,
+                    "DRAW_SCALE"    => a.Properties.TryGetValue("scale", out var sc)
+                                         ? sc?.ToString() ?? "1:100" : "1:100",
+                    "DRAW_DATE"     => System.DateTime.UtcNow.ToString("yyyy-MM-dd"),
+                    _               => attDef.TextString,
+                };
+                bref.AttributeCollection.AppendAttribute(attRef);
+                tr.AddNewlyCreatedDBObject(attRef, true);
+            }
+        }
+
+        private void PopulateTitleBlockDef(BlockTableRecord btr, Transaction tr)
+        {
+            // Title block frame: 200mm × 50mm box, drawn at origin, scaled to drawing units
+            double bw = 200 * _s;
+            double bh = 50  * _s;
+            double div = bh * 0.55;   // divider between title row and info row
+
+            // Outer border
+            var border = new Polyline();
+            border.AddVertexAt(0, new Point2d(0,  0),  0, 0, 0);
+            border.AddVertexAt(1, new Point2d(bw, 0),  0, 0, 0);
+            border.AddVertexAt(2, new Point2d(bw, bh), 0, 0, 0);
+            border.AddVertexAt(3, new Point2d(0,  bh), 0, 0, 0);
+            border.Closed        = true;
+            border.ConstantWidth = 0.8 * _s;
+            border.Layer         = "A-ANNO-TTLB";
+            btr.AppendEntity(border);
+            tr.AddNewlyCreatedDBObject(border, true);
+
+            // Horizontal divider between project title and info row
+            var divLine = new Line(new Point3d(0, div, 0), new Point3d(bw, div, 0));
+            divLine.Layer = "A-ANNO-TTLB";
+            btr.AppendEntity(divLine);
+            tr.AddNewlyCreatedDBObject(divLine, true);
+
+            // Vertical divider: Scale | Date
+            double vd = bw * 0.45;
+            var vLine = new Line(new Point3d(vd, 0, 0), new Point3d(vd, div, 0));
+            vLine.Layer = "A-ANNO-TTLB";
+            btr.AppendEntity(vLine);
+            tr.AddNewlyCreatedDBObject(vLine, true);
+
+            // PROJECT_TITLE attribute definition
+            AddAttDef(btr, tr, "PROJECT_TITLE", "Project Title",
+                new Point3d(4 * _s, div + 6 * _s, 0), 6 * _s, "PROJECT TITLE");
+
+            // DRAW_SCALE attribute definition
+            AddAttDef(btr, tr, "DRAW_SCALE", "Scale",
+                new Point3d(3 * _s, 6 * _s, 0), 4 * _s, "1:100");
+
+            // DRAW_DATE attribute definition
+            AddAttDef(btr, tr, "DRAW_DATE", "Date",
+                new Point3d(vd + 3 * _s, 6 * _s, 0), 4 * _s,
+                System.DateTime.UtcNow.ToString("yyyy-MM-dd"));
+        }
+
+        private static void AddAttDef(BlockTableRecord btr, Transaction tr,
+                                       string tag, string prompt,
+                                       Point3d pos, double height, string defaultVal)
+        {
+            var att = new AttributeDefinition();
+            att.Tag         = tag;
+            att.Prompt      = prompt;
+            att.TextString  = defaultVal;
+            att.Position    = pos;
+            att.Height      = height;
+            att.Layer       = "A-ANNO-TTLB";
+            att.Invisible   = false;
+            btr.AppendEntity(att);
+            tr.AddNewlyCreatedDBObject(att, true);
+        }
+
         private void DrawDimension(DrawAction a, Point3d offset,
                                     BlockTableRecord space, Transaction tr)
         {
             var p1  = To3d(a.Start!, offset);
             var p2  = To3d(a.End!,   offset);
             var mid = new Point3d((p1.X + p2.X) / 2, p1.Y - 600 * _s, 0);
-            var dim = new RotatedDimension(0, p1, p2, mid, "", ObjectId.Null);
+            var dim = new RotatedDimension(0, p1, p2, mid, "", EnsureDimStyle(tr));
             dim.Layer = "A-ANNO-DIMS";
             space.AppendEntity(dim);
             tr.AddNewlyCreatedDBObject(dim, true);
+        }
+
+        private ObjectId EnsureDimStyle(Transaction tr)
+        {
+            // D-01: return cached ObjectId — avoids DimStyleTable lookup on every variation
+            if (!_dimStyleId.IsNull)
+                return _dimStyleId;
+
+            var dst = (DimStyleTable)tr.GetObject(_db.DimStyleTableId, OpenMode.ForRead);
+            if (dst.Has("ZHEIGHT-DIMS"))
+            {
+                _dimStyleId = dst["ZHEIGHT-DIMS"];
+                return _dimStyleId;
+            }
+
+            dst.UpgradeOpen();
+            var dsr = new DimStyleTableRecord();
+            dsr.Name     = "ZHEIGHT-DIMS";
+            dsr.Dimscale = 100.0;  // 1:100 architectural sheet
+            dsr.Dimasz   = 3.0;    // 3mm arrow/tick
+            dsr.Dimtxt   = 3.0;    // 3mm text height
+            dsr.Dimexe   = 1.5;    // 1.5mm extension above tick
+            dsr.Dimexo   = 1.5;    // 1.5mm extension offset
+            dsr.Dimgap   = 1.0;    // 1mm text-to-line gap
+            dsr.Dimlunit = 4;      // Architectural units (feet + inches)
+            dsr.Dimdec   = 0;      // 0 decimal places
+            _dimStyleId = dst.Add(dsr);
+            tr.AddNewlyCreatedDBObject(dsr, true);
+            return _dimStyleId;
         }
 
         private void DrawHatch(DrawAction a, Point3d offset,

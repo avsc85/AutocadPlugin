@@ -12,7 +12,8 @@ import structlog
 from fastapi import FastAPI, Request, HTTPException
 from sqlalchemy import text
 
-import sys; sys.path.insert(0, "/app")
+import sys
+sys.path.insert(0, "/app")
 from shared.db.client import get_db
 
 log = structlog.get_logger()

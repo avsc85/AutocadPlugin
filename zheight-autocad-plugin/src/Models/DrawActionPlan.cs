@@ -69,6 +69,53 @@ namespace zHeight.Plugin.Models
         [JsonProperty("properties")]       public Dictionary<string, object> Properties { get; set; } = new();
     }
 
+    public class ZoneSpaceContract
+    {
+        [JsonProperty("name")]              public string Name { get; set; } = "";
+        [JsonProperty("type")]              public string Type { get; set; } = "";
+        [JsonProperty("area_sqm")]          public double? AreaSqm { get; set; }
+        [JsonProperty("floor")]             public int Floor { get; set; } = 1;
+        [JsonProperty("has_natural_light")] public bool HasNaturalLight { get; set; } = true;
+        [JsonProperty("privacy_level")]     public string? PrivacyLevel { get; set; }
+        [JsonProperty("adjacency")]         public Dictionary<string, object> Adjacency { get; set; } = new();
+        [JsonProperty("aspect_ratio")]      public double? AspectRatio { get; set; }
+        [JsonProperty("min_width_m")]       public double? MinWidthM { get; set; }
+        [JsonProperty("min_depth_m")]       public double? MinDepthM { get; set; }
+    }
+
+    public class ZoneGroupContract
+    {
+        // VALIDATION-FIX: CHECK-F01 — added ZoneId, OpenPlan, SolarWall for typed contract completeness
+        [JsonProperty("zone_id")]       public string ZoneId { get; set; } = "";
+        [JsonProperty("zone_name")]     public string ZoneName { get; set; } = "";
+        [JsonProperty("zone_position")] public string ZonePosition { get; set; } = "front";
+        [JsonProperty("open_plan")]     public bool OpenPlan { get; set; } = false;
+        [JsonProperty("solar_wall")]    public string SolarWall { get; set; } = "";
+        [JsonProperty("spaces")]        public List<ZoneSpaceContract> Spaces { get; set; } = new();
+    }
+
+    public class SiteConstraintsContract
+    {
+        [JsonProperty("plot_width_mm")]    public double? PlotWidthMm { get; set; }
+        [JsonProperty("plot_depth_mm")]    public double? PlotDepthMm { get; set; }
+        [JsonProperty("front_setback_mm")] public double? FrontSetbackMm { get; set; }
+        [JsonProperty("side_setback_mm")]  public double? SideSetbackMm { get; set; }
+        [JsonProperty("rear_setback_mm")]  public double? RearSetbackMm { get; set; }
+    }
+
+    public class VariationPayload
+    {
+        [JsonProperty("zones")]                 public List<ZoneGroupContract> Zones { get; set; } = new();
+        [JsonProperty("organisation_strategy")] public string OrganisationStrategy { get; set; } = "residential";
+        [JsonProperty("organisation_type")]     public string? OrganisationType { get; set; }
+        [JsonProperty("wing_orientation")]      public string WingOrientation { get; set; } = "living_left";
+        [JsonProperty("garage_placement")]      public string GaragePlacement { get; set; } = "rear";
+        [JsonProperty("structural_grid_m")]     public double StructuralGridM { get; set; } = 4.0;
+        [JsonProperty("entry_space")]           public string EntrySpace { get; set; } = "";
+        [JsonProperty("site_constraints")]      public SiteConstraintsContract? SiteConstraints { get; set; }
+        [JsonProperty("validation_warnings")]   public List<string> ValidationWarnings { get; set; } = new();
+    }
+
     public class VariationPlan
     {
         [JsonProperty("variation_id")]      public int VariationId { get; set; }
@@ -84,7 +131,8 @@ namespace zHeight.Plugin.Models
         [JsonProperty("constraint_report")] public ConstraintReport ConstraintReport { get; set; } = new();
         [JsonProperty("passive_notes")]     public string PassiveNotes { get; set; } = "";
         [JsonProperty("warnings")]          public List<string> Warnings { get; set; } = new();
-        [JsonProperty("properties")]        public Dictionary<string, object> Properties { get; set; } = new();
+        [JsonProperty("layout")]            public VariationPayload? Layout { get; set; }
+        [JsonProperty("properties")]        public Dictionary<string, object> Properties { get; set; } = new(); // legacy; prefer Layout
     }
 
     public class DrawActionPlan

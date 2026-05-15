@@ -9,9 +9,12 @@ Production fixes vs Phase 2 draft:
 - Cache invalidation hook for approved project count changes
 """
 from __future__ import annotations
-import hashlib, json, os
+import hashlib, json, os, sys
 import structlog
 from sqlalchemy import text
+
+sys.path.insert(0, "/app")
+from shared.db.client import get_read_db
 
 from .embedder import embed_texts
 
@@ -134,9 +137,6 @@ async def _three_vector_search(
     sw, stw, iw,
     category, tags, min_area, max_area, limit
 ) -> list[dict]:
-    import sys; sys.path.insert(0, "/app")
-    from shared.db.client import get_read_db
-
     filters = ["p.approved = TRUE"]
     params: dict = {
         "sv":    "[" + ",".join(str(round(v, 8)) for v in spatial_vec) + "]",

@@ -6,7 +6,8 @@ from __future__ import annotations
 import asyncio, os
 from google import genai
 
-import sys; sys.path.insert(0, "/app")
+import sys
+sys.path.insert(0, "/app")
 from shared.utils.retry import async_retry
 
 _client = None

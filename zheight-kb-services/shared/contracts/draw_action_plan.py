@@ -84,6 +84,64 @@ class ConstraintReport(BaseModel):
     adjacency_failed:  list[str] = []
 
 
+# ── F-01: Typed layout contract — replaces stringly-typed Properties dict ────────
+
+class ZoneSpaceContract(BaseModel):
+    """Typed contract for a single space/room within a zone."""
+    name:              str = ""
+    type:              str = ""
+    area_sqm:          float | None = None
+    floor:             int = 1
+    has_natural_light: bool = True
+    privacy_level:     str | None = None
+    # VALIDATION-FIX: CHECK-F01 — typed as dict[str, list[str]] instead of opaque dict
+    adjacency:         dict[str, list[str]] = {}
+    aspect_ratio:      float | None = None
+    min_width_m:       float | None = None
+    min_depth_m:       float | None = None
+
+    class Config:
+        extra = "ignore"
+
+
+class ZoneGroupContract(BaseModel):
+    """Typed contract for a zone group (front / centre / rear / service)."""
+    # VALIDATION-FIX: CHECK-F01 — added zone_id, open_plan, solar_wall
+    zone_id:       str = ""
+    zone_name:     str = ""
+    zone_position: str = "front"
+    open_plan:     bool = False
+    solar_wall:    str = ""
+    spaces:        list[ZoneSpaceContract] = []
+
+    class Config:
+        extra = "ignore"
+
+
+class SiteConstraintsContract(BaseModel):
+    plot_width_mm:    float | None = None
+    plot_depth_mm:    float | None = None
+    front_setback_mm: float | None = None
+    side_setback_mm:  float | None = None
+    rear_setback_mm:  float | None = None
+
+
+class VariationPayload(BaseModel):
+    """Typed layout payload — eliminates zones_json escaped string antipattern."""
+    zones:                  list[ZoneGroupContract] = []
+    organisation_strategy:  str = "residential"
+    organisation_type:      str | None = None
+    wing_orientation:       str = "living_left"
+    garage_placement:       str = "rear"
+    structural_grid_m:      float = 4.0
+    entry_space:            str = ""
+    site_constraints:       SiteConstraintsContract | None = None
+    validation_warnings:    list[str] = []
+
+    class Config:
+        extra = "ignore"
+
+
 class VariationPlan(BaseModel):
     variation_id:        int
     variation_name:      str
@@ -98,7 +156,8 @@ class VariationPlan(BaseModel):
     constraint_report:   ConstraintReport = Field(default_factory=ConstraintReport)
     passive_notes:       str = ""
     warnings:            list[str] = []
-    properties:          dict = {}  # zone layout data for C# GridLayoutEngine
+    layout:              VariationPayload = Field(default_factory=VariationPayload)
+    properties:          dict = {}  # legacy — kept for backward compat; prefer layout
 
     class Config:
         use_enum_values = True

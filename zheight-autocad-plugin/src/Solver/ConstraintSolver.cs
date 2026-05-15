@@ -224,14 +224,91 @@ namespace zHeight.Plugin.Solver
                         $"{ur.Name}: may not be reachable from entry — check circulation");
             }
 
+            // VALIDATION-FIX: CHECK-CS03 — required type-based adjacency pairs
+            CheckRequiredAdjacency(rooms, result);
+
+            // VALIDATION-FIX: CHECK-MISSING-10 — stair alignment across floors
+            ValidateStairAlignment(rooms, result);
+
             return result;
+        }
+
+        // VALIDATION-FIX: CHECK-CS03 — validate required architectural adjacency pairs by room type
+        private static void CheckRequiredAdjacency(List<RoomRect> rooms, SolverResult result)
+        {
+            static RoomRect? FindByType(List<RoomRect> rms, params string[] types) =>
+                rms.FirstOrDefault(r => types.Any(t =>
+                    string.Equals(r.Type, t, StringComparison.OrdinalIgnoreCase)));
+
+            // kitchen ↔ dining
+            var kitchen = FindByType(rooms, "kitchen", "open_kitchen", "kitchen_dining");
+            var dining  = FindByType(rooms, "dining_room", "dining", "breakfast_nook");
+            if (kitchen != null && dining != null && !kitchen.IsAdjacentTo(dining))
+                result.Warnings.Add("Adjacency required: Kitchen should be adjacent to Dining — not met");
+
+            // kitchen ↔ living
+            var living = FindByType(rooms, "living_room", "living", "great_room", "family_room", "open_living");
+            if (kitchen != null && living != null && !kitchen.IsAdjacentTo(living))
+                result.Warnings.Add("Adjacency required: Kitchen should be adjacent to Living — not met");
+
+            // primary_bedroom ↔ primary_bath
+            var primBed  = FindByType(rooms, "primary_bedroom", "primary_suite", "master_bedroom");
+            var primBath = FindByType(rooms, "primary_bath", "ensuite_bath", "ensuite", "master_bath");
+            if (primBed != null && primBath != null && !primBed.IsAdjacentTo(primBath))
+                result.Warnings.Add("Adjacency required: Primary Bedroom should be adjacent to Primary Bath — not met");
+
+            // entry ↔ powder_room (only if both present)
+            var entry  = FindByType(rooms, "entry", "foyer", "entry_foyer", "vestibule");
+            var powder = FindByType(rooms, "powder_room", "half_bath", "toilet");
+            if (entry != null && powder != null && !entry.IsAdjacentTo(powder, 3000))
+                result.Warnings.Add("Adjacency recommended: Entry/Foyer should be near Powder Room — not met");
+
+            // garage ↔ mudroom (only if both present)
+            var garage  = FindByType(rooms, "garage");
+            var mudroom = FindByType(rooms, "mudroom", "mud_room", "garage_entry");
+            if (garage != null && mudroom != null && !garage.IsAdjacentTo(mudroom))
+                result.Warnings.Add("Adjacency required: Garage should be adjacent to Mudroom — not met");
+        }
+
+        // VALIDATION-FIX: CHECK-MISSING-10 — stair footprints must vertically align across floors
+        private static void ValidateStairAlignment(List<RoomRect> rooms, SolverResult result)
+        {
+            var floor1Stairs = rooms
+                .Where(r => r.Floor == 1 &&
+                            (r.Type.Contains("stair") || r.Name.ToLower().Contains("stair")))
+                .ToList();
+            var floor2Stairs = rooms
+                .Where(r => r.Floor == 2 &&
+                            (r.Type.Contains("stair") || r.Name.ToLower().Contains("stair")))
+                .ToList();
+
+            if (!floor1Stairs.Any() || !floor2Stairs.Any()) return;
+
+            foreach (var s1 in floor1Stairs)
+            {
+                bool aligned = floor2Stairs.Any(s2 =>
+                {
+                    double overlapX = Math.Min(s1.Right, s2.Right) - Math.Max(s1.X, s2.X);
+                    double overlapY = Math.Min(s1.Top,   s2.Top)   - Math.Max(s1.Y, s2.Y);
+                    if (overlapX <= 0 || overlapY <= 0) return false;
+                    double overlapArea = overlapX * overlapY;
+                    double minArea     = Math.Min(s1.Width * s1.Height, s2.Width * s2.Height);
+                    return overlapArea / minArea >= 0.80;
+                });
+                if (!aligned)
+                    result.Warnings.Add(
+                        $"Stair '{s1.Name}' (floor 1) does not align with any floor-2 stair — structural issue");
+            }
         }
 
         // ── Helpers ───────────────────────────────────────────────────────────
 
+        // VALIDATION-FIX: CHECK-CS02 — enrich rooms from typed Layout.Zones when available
         private static List<RoomRect> ExtractRooms(VariationPlan plan)
         {
             var rooms = new List<RoomRect>();
+
+            // ── Geometry always comes from actions (they carry X/Y) ──────────────
             var labelActions = plan.Actions
                 .Where(a => a.ActionType == ActionType.DRAW_ROOM_LABEL &&
                             a.Center != null)
@@ -241,6 +318,16 @@ namespace zHeight.Plugin.Solver
                 .Where(a => a.GroupId != null)
                 .GroupBy(a => a.GroupId)
                 .ToDictionary(g => g.Key!, g => g.ToList());
+
+            // Build typed metadata lookup from Layout.Zones when present
+            var typedMeta = new Dictionary<string, ZoneSpaceContract>(
+                StringComparer.OrdinalIgnoreCase);
+            if (plan.Layout?.Zones?.Count > 0)
+            {
+                foreach (var zone in plan.Layout.Zones)
+                foreach (var sp in zone.Spaces)
+                    typedMeta[sp.Name] = sp;
+            }
 
             foreach (var label in labelActions)
             {
@@ -263,20 +350,45 @@ namespace zHeight.Plugin.Solver
                     .FirstOrDefault(s => gid.Contains(
                         s.Name.ToUpper().Replace(" ", "_")));
 
+                string roomName = label.LabelText ?? summary?.Name ?? gid;
+
+                // Prefer typed contract for adjacency/separation metadata
+                List<string> mustAdj = new();
+                List<string> mustSep = new();
+                if (typedMeta.TryGetValue(roomName, out var meta))
+                {
+                    // Adjacency is Dictionary<string,object>; values are JArray or List<string> at runtime
+                    if (meta.Adjacency.TryGetValue("must_be_adjacent_to", out var adj))
+                        mustAdj = ToStringList(adj);
+                    if (meta.Adjacency.TryGetValue("must_be_separated_from", out var sep))
+                        mustSep = ToStringList(sep);
+                }
+
                 rooms.Add(new RoomRect
                 {
-                    Name   = label.LabelText ?? summary?.Name ?? gid,
-                    Type   = summary?.Type ?? "",
-                    X      = minX,
-                    Y      = minY,
-                    Width  = Math.Max(maxX - minX, 1),
-                    Height = Math.Max(maxY - minY, 1),
-                    Floor  = summary?.Floor ?? 1,
+                    Name                = roomName,
+                    Type                = summary?.Type ?? "",
+                    X                   = minX,
+                    Y                   = minY,
+                    Width               = Math.Max(maxX - minX, 1),
+                    Height              = Math.Max(maxY - minY, 1),
+                    Floor               = summary?.Floor ?? 1,
+                    MustBeAdjacentTo    = mustAdj,
+                    MustBeSeparatedFrom = mustSep,
                 });
             }
 
             return rooms;
         }
+
+        private static List<string> ToStringList(object? val) => val switch
+        {
+            List<string> ls                     => ls,
+            IEnumerable<object> en              => en.Select(x => x?.ToString() ?? "")
+                                                     .Where(s => s.Length > 0).ToList(),
+            string s when s.Length > 0          => new List<string> { s },
+            _                                   => new List<string>(),
+        };
 
         private static HashSet<string> BfsReach(
             RoomRect entry, List<RoomRect> all, double corridorWidth)

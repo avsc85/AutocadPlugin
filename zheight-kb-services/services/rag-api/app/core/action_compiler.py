@@ -12,11 +12,13 @@ import math
 import uuid
 from datetime import datetime, timezone
 
+import structlog
 import sys
 sys.path.insert(0, "/app")
 from shared.contracts.draw_action_plan import (
     DrawAction, DrawActionPlan, VariationPlan, ActionType,
-    Point2D, SpaceSummaryItem, ConstraintReport
+    Point2D, SpaceSummaryItem, ConstraintReport,
+    VariationPayload, ZoneGroupContract, ZoneSpaceContract, SiteConstraintsContract,
 )
 
 WALL_THICKNESS = {"external": 230, "structural": 230,
@@ -35,6 +37,124 @@ ROOM_ASPECT = {
     "bathroom": 1.2,    "office": 1.5,  "meeting_room": 1.8,
     "default": 1.4,
 }
+
+log = structlog.get_logger()
+
+# ── Zone position inference from room type ────────────────────────────────────
+_TYPE_TO_ZONE: dict[str, str] = {
+    "entry": "front",        "foyer": "front",         "entry_foyer": "front",
+    "vestibule": "front",    "front_entry": "front",   "lobby": "front",
+    "powder_room": "front",  "half_bath": "front",     "toilet": "front",
+    "primary_bedroom": "rear",   "master_bedroom": "rear",  "secondary_bedroom": "rear",
+    "guest_bedroom": "rear",     "guest_room": "rear",      "nursery": "rear",
+    "bedroom": "rear",
+    "primary_bath": "rear",  "ensuite": "rear",         "ensuite_bath": "rear",
+    "master_bath": "rear",   "bathroom": "rear",        "full_bath": "rear",
+    "shared_bath": "rear",   "walk_in_closet": "rear",  "closet": "rear",
+    "laundry": "service",    "laundry_room": "service", "mudroom": "service",
+    "mud_room": "service",   "garage": "service",       "utility": "service",
+    "mechanical": "service", "storage": "service",      "pantry": "service",
+}
+
+
+def _infer_zone_pos(room_type: str) -> str:
+    t = (room_type or "").lower().replace("-", "_").replace(" ", "_")
+    return _TYPE_TO_ZONE.get(t, "centre")
+
+
+# FIX-ARCH-04: half-bath types are public-zone guest facilities — never in bedroom wing
+_HALF_BATH_TYPES = {"powder_room", "half_bath", "toilet"}
+
+
+def _reclassify_halfbaths_to_front(zones: list) -> list:
+    """Move any half-bath rooms from non-front zones into the front zone.
+
+    Gemini occasionally places powder_room in zone 'rear'. This corrects that
+    before the C# solver sees the data, ensuring entry-row placement.
+    """
+    migrated: list[dict] = []
+    for zone in zones:
+        if zone.get("zone_position") == "front":
+            continue
+        remaining = []
+        for s in zone.get("spaces") or []:
+            t = (s.get("type") or "").lower().replace("-", "_").replace(" ", "_")
+            if t in _HALF_BATH_TYPES:
+                migrated.append(s)
+            else:
+                remaining.append(s)
+        zone["spaces"] = remaining
+
+    if not migrated:
+        return [z for z in zones if z.get("spaces")]
+
+    front = next((z for z in zones if z.get("zone_position") == "front"), None)
+    if front is None:
+        front = {"zone_name": "front", "zone_position": "front", "spaces": []}
+        zones = list(zones) + [front]
+    front.setdefault("spaces", []).extend(migrated)
+
+    return [z for z in zones if z.get("spaces")]
+
+
+def _normalize_to_zones(variation: dict) -> list | None:
+    """Normalize any supported schema to the canonical zones list for GridLayoutEngine.
+
+    Priority: zones → spaces → room_graph → area_program.
+    Flat space lists are grouped by zone_position/type into zone objects.
+    Returns None when no valid spatial data exists.
+    """
+    # 1. zones key — canonical, preferred
+    raw_zones = variation.get("zones")
+    if raw_zones and isinstance(raw_zones, list) and len(raw_zones) > 0:
+        total_spaces = sum(len(z.get("spaces", [])) for z in raw_zones
+                          if isinstance(z, dict))
+        log.debug("zones_schema_detected", source="zones",
+                  zone_count=len(raw_zones), space_count=total_spaces)
+        return _reclassify_halfbaths_to_front(raw_zones)
+
+    # 2. Flat space lists under alternate keys
+    flat: list | None = None
+    source = ""
+    for key in ("spaces", "room_graph", "area_program"):
+        candidate = variation.get(key)
+        if candidate and isinstance(candidate, list) and len(candidate) > 0:
+            flat = candidate
+            source = key
+            break
+
+    if not flat:
+        log.warning("zones_no_spatial_data", keys=list(variation.keys()))
+        return None
+
+    log.info("zones_normalizing_flat_spaces", source=source, space_count=len(flat))
+
+    # Group flat spaces by zone_position
+    zone_map: dict[str, list] = {}
+    for s in flat:
+        if not isinstance(s, dict):
+            continue
+        pos = (s.get("zone_position") or
+               s.get("_zone_position") or
+               _infer_zone_pos(s.get("type", "")))
+        zone_map.setdefault(pos, []).append(s)
+
+    if not zone_map:
+        log.warning("zones_normalization_empty_after_grouping")
+        return None
+
+    zones = [
+        {"zone_name": pos, "zone_position": pos, "spaces": rooms}
+        for pos, rooms in zone_map.items()
+        if rooms
+    ]
+    total_adj = sum(
+        len(s.get("adjacency", [])) for z in zones for s in z["spaces"]
+    )
+    log.info("zones_normalization_complete", zone_count=len(zones),
+             total_spaces=len(flat), adjacency_entries=total_adj)
+    return _reclassify_halfbaths_to_front(zones)
+
 
 AIA_LAYERS = {
     "A-WALL":       {"color": 7,  "linetype": "CONTINUOUS", "lw": 0.50},
@@ -315,6 +435,106 @@ class ActionCompiler:
                     facing, Point2D(x=x+w/2, y=y))
 
 
+# ── A-03: Room area validation table ─────────────────────────────────────────
+# (min_sqm, max_sqm) per approved room type — prevents Gemini hallucinating
+# impossible sizes (3 sqm living room, 80 sqm powder room, etc.)
+ROOM_AREA_LIMITS: dict[str, tuple[float, float]] = {
+    "entry":             (2.0,  14.0),
+    "foyer":             (2.0,  14.0),
+    "powder_room":       (1.5,   4.5),
+    "half_bath":         (1.5,   4.5),
+    "toilet":            (1.2,   4.0),
+    "bathroom":          (3.0,  12.0),
+    "primary_bath":      (4.0,  20.0),
+    "ensuite_bath":      (4.0,  20.0),
+    "master_bath":       (4.0,  20.0),
+    "secondary_bath":    (3.0,  10.0),
+    "shared_bath":       (3.0,  10.0),
+    "full_bath":         (3.0,  12.0),
+    "walk_in_closet":    (3.0,  16.0),
+    "closet":            (1.5,   8.0),
+    "wic":               (3.0,  16.0),
+    "dressing_room":     (4.0,  18.0),
+    "primary_bedroom":   (14.0, 40.0),
+    "master_bedroom":    (14.0, 40.0),
+    "secondary_bedroom": (9.0,  28.0),
+    "guest_bedroom":     (9.0,  28.0),
+    "bedroom":           (9.0,  28.0),
+    "home_office_bedroom":(9.0, 28.0),
+    "kitchen":           (7.0,  35.0),
+    "dining":            (8.0,  40.0),
+    "living":            (15.0, 65.0),
+    "great_room":        (20.0, 90.0),
+    "family_room":       (15.0, 65.0),
+    "open_plan":         (25.0, 110.0),
+    "laundry":           (3.5,  14.0),
+    "laundry_room":      (3.5,  14.0),
+    "mudroom":           (3.0,  14.0),
+    "garage":            (25.0, 80.0),
+    "pantry":            (1.5,   8.0),
+    "utility":           (3.0,  18.0),
+    "mechanical":        (3.0,  18.0),
+    "storage":           (2.0,  18.0),
+    "enclair":           (10.0, 55.0),
+    "sunroom":           (8.0,  45.0),
+    "covered_porch":     (6.0,  40.0),
+    "veranda":           (6.0,  40.0),
+    "lanai":             (8.0,  50.0),
+}
+
+
+def _validate_area(room_type: str, area_sqm: float) -> tuple[float, list[str]]:
+    """Clamp area to realistic bounds. Returns (clamped_area, warnings)."""
+    t = (room_type or "").lower().replace("-", "_").replace(" ", "_")
+    limits = ROOM_AREA_LIMITS.get(t)
+    if limits is None:
+        return area_sqm, []
+    lo, hi = limits
+    if area_sqm < lo:
+        return lo, [f"{room_type}: {area_sqm:.1f}sqm < min {lo}sqm — clamped to {lo}"]
+    if area_sqm > hi:
+        return hi, [f"{room_type}: {area_sqm:.1f}sqm > max {hi}sqm — clamped to {hi}"]
+    return area_sqm, []
+
+
+def _validate_and_clamp_zones(variation: dict) -> list[str]:
+    """Validate and clamp all room areas. Mutates variation zones in-place. Returns warnings."""
+    all_warnings: list[str] = []
+    for zone in (variation.get("zones") or []):
+        for space in (zone.get("spaces") or []):
+            area = space.get("area_sqm")
+            rt = (space.get("type") or "").lower().replace("-", "_").replace(" ", "_")
+            if not area or float(area) <= 0:
+                limits = ROOM_AREA_LIMITS.get(rt)
+                if limits:
+                    default_area = round((limits[0] + limits[1]) / 2, 1)
+                    space["area_sqm"] = default_area
+                    all_warnings.append(
+                        f"{space.get('name','?')} ({rt}): missing area — defaulting to {default_area}sqm")
+            else:
+                clamped, warns = _validate_area(space.get("type", ""), float(area))
+                if warns:
+                    space["area_sqm"] = clamped
+                    all_warnings.extend(warns)
+    return all_warnings
+
+
+# VALIDATION-FIX: CHECK-F01 — normalise Gemini adjacency output to dict[str, list[str]]
+def _normalise_adjacency(raw: object) -> dict[str, list[str]]:
+    """Gemini may return adjacency as a dict-of-lists OR a bare list.
+    Always return dict[str, list[str]] with canonical keys."""
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        result: dict[str, list[str]] = {}
+        for k, v in raw.items():
+            result[k] = list(v) if isinstance(v, list) else ([str(v)] if v else [])
+        return result
+    if isinstance(raw, list):
+        return {"connected_to": [str(x) for x in raw]}
+    return {}
+
+
 def compile_to_plan(generation: dict, request_id: str,
                      autocad_units: str = "mm") -> DrawActionPlan:
     compiler   = ActionCompiler()
@@ -323,20 +543,86 @@ def compile_to_plan(generation: dict, request_id: str,
 
     for i, v in enumerate(generation.get("variations", [])):
         try:
+            # A-03: validate and clamp room areas before compilation
+            area_warnings = _validate_and_clamp_zones(v)
+            for w in area_warnings:
+                log.warning("room_area_clamped", variation=i, detail=w)
+
             vp = compiler.compile(v, i, total_area)
-            # Pass zone graph through to C# GridLayoutEngine via VariationPlan.properties
-            if v.get("zones"):
-                vp.properties["zones_json"]            = json.dumps(v["zones"])
-                vp.properties["organisation_strategy"] = v.get("organisation_strategy", "linear")
+
+            # Normalize to canonical zones and always forward to C# GridLayoutEngine
+            zones = _normalize_to_zones(v)
+            if zones:
+                # F-01: populate typed Layout contract (primary path for C# plugin)
+                # VALIDATION-FIX: CHECK-F01 — pass zone_id, open_plan, typed adjacency lists
+                typed_zones = [
+                    ZoneGroupContract(
+                        zone_id=z.get("zone_id", ""),
+                        zone_name=z.get("zone_name", ""),
+                        zone_position=z.get("zone_position", "front"),
+                        open_plan=bool(z.get("open_plan", False)),
+                        solar_wall=z.get("solar_wall", ""),
+                        spaces=[
+                            ZoneSpaceContract(
+                                name=s.get("name", ""),
+                                type=s.get("type", ""),
+                                area_sqm=s.get("area_sqm"),
+                                floor=s.get("floor", 1),
+                                has_natural_light=s.get("has_natural_light", True),
+                                privacy_level=s.get("privacy_level"),
+                                # Normalise adjacency: accept both dict-of-lists and bare list
+                                adjacency=_normalise_adjacency(s.get("adjacency")),
+                                aspect_ratio=s.get("aspect_ratio"),
+                                min_width_m=s.get("min_width_m"),
+                                min_depth_m=s.get("min_depth_m"),
+                            )
+                            for s in (z.get("spaces") or [])
+                            if isinstance(s, dict)
+                        ],
+                    )
+                    for z in zones
+                    if isinstance(z, dict)
+                ]
+                sc_raw = generation.get("site_constraints") or {}
+                site_constraints = SiteConstraintsContract(
+                    plot_width_mm=sc_raw.get("plot_width_mm"),
+                    plot_depth_mm=sc_raw.get("plot_depth_mm"),
+                    front_setback_mm=sc_raw.get("front_setback_mm"),
+                    side_setback_mm=sc_raw.get("side_setback_mm"),
+                    rear_setback_mm=sc_raw.get("rear_setback_mm"),
+                ) if sc_raw else None
+                vp.layout = VariationPayload(
+                    zones=typed_zones,
+                    organisation_strategy=v.get("organisation_strategy", "residential"),
+                    organisation_type=v.get("organisation_type"),
+                    wing_orientation=v.get("wing_orientation", "living_left"),
+                    garage_placement=v.get("garage_placement", "rear"),
+                    structural_grid_m=v.get("structural_grid_m", 4.0),
+                    entry_space=v.get("entry_space", ""),
+                    site_constraints=site_constraints,
+                    validation_warnings=area_warnings[:5],
+                )
+                # legacy properties — kept for backward compat with older plugin versions
+                vp.properties["zones_json"]            = json.dumps(zones)
+                vp.properties["organisation_strategy"] = v.get("organisation_strategy",
+                                                                "residential")
                 vp.properties["structural_grid_m"]     = v.get("structural_grid_m", 4.0)
                 vp.properties["entry_space"]           = v.get("entry_space", "")
+                vp.properties["wing_orientation"]      = v.get("wing_orientation",
+                                                                "living_left")
+                vp.properties["garage_placement"]      = v.get("garage_placement", "rear")
+                log.info("zones_json_populated", variation=i, zone_count=len(zones))
+                if area_warnings:
+                    vp.warnings.extend(area_warnings[:5])  # cap warning list length
+            else:
+                log.warning("zones_json_missing_no_spatial_data", variation=i,
+                            available_keys=list(v.keys()))
+
             if generation.get("site_constraints"):
                 vp.properties["site_constraints"] = json.dumps(generation["site_constraints"])
             variations.append(vp)
         except Exception as e:
-            import structlog
-            structlog.get_logger().error(
-                "variation_compile_error", variation=i, error=str(e))
+            log.error("variation_compile_error", variation=i, error=str(e))
 
     return DrawActionPlan(
         request_id=request_id,

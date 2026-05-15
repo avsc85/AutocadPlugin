@@ -40,6 +40,11 @@ namespace zHeight.Plugin.Solver
         public double MinWidthM         { get; set; } = 2.4;
         public double MinDepthM         { get; set; } = 2.4;
 
+        public bool   IsOpenPlan { get; set; } = false;
+        // Solar wall: the facade that should receive primary windows (MISSING-03).
+        // Empty string = fall back to Facing for window placement.
+        public string SolarWall  { get; set; } = "";
+
         public double X       { get; set; }
         public double Y       { get; set; }
         public double WidthMm { get; set; }
@@ -71,7 +76,8 @@ namespace zHeight.Plugin.Solver
         private const double GRID    = 300;   // mm snap (≈ 1 ft)
         private const double STRUCT  = 1219;  // mm structural grid (4 ft)
         private const double MIN_DIM = 1800;  // mm minimum room side
-        private const double HALLWAY = 1219;  // mm corridor width (4 ft)
+        // VALIDATION-FIX: CHECK-C06 — 1219mm (4ft) is substandard; 1500mm is premium residential minimum
+        private const double HALLWAY = 1500;  // mm corridor width — premium residential minimum
         private const double CORRIDOR= 1200;  // mm strip corridor (linear fallback)
 
         // ── Type normalisation ─────────────────────────────────────────────────
@@ -172,10 +178,12 @@ namespace zHeight.Plugin.Solver
             string          strategy,
             double          plotW,
             double          plotD,
-            double          frontSetback = 7500,
-            double          sideSetback  = 1500,
-            double          rearSetback  = 7500,
-            double          gridModule   = 4000)
+            double          frontSetback    = 7500,
+            double          sideSetback     = 1500,
+            double          rearSetback     = 7500,
+            double          gridModule      = 4000,
+            string          wingOrientation = "living_left",
+            string          garagePlacement = "rear")
         {
             var result   = new LayoutResult();
             var warnings = new List<string>();
@@ -199,9 +207,16 @@ namespace zHeight.Plugin.Solver
             var allSpaces     = zones.SelectMany(z => z.Spaces).ToList();
             bool isResidential = allSpaces.Any(s => BedTypes.Contains(s.Type));
 
-            if (isResidential && strategy != "spine")
-                LayoutResidentialWing(zones, bx, by, bw, bd, result, warnings);
-            else if (strategy == "spine")
+            // "residential" strategy explicitly activates wing layout even when
+            // type detection fails (e.g. incomplete zone data from Gemini)
+            bool useResidential = isResidential ||
+                string.Equals(strategy, "residential", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(strategy, "open_plan",   StringComparison.OrdinalIgnoreCase);
+
+            if (useResidential && !string.Equals(strategy, "spine", StringComparison.OrdinalIgnoreCase))
+                LayoutResidentialWing(zones, bx, by, bw, bd, result, warnings,
+                                      strategy, wingOrientation, garagePlacement);
+            else if (string.Equals(strategy, "spine", StringComparison.OrdinalIgnoreCase))
                 LayoutSpine(zones, bx, by, bw, bd, result.Rooms, warnings);
             else
                 LayoutLinear(zones, bx, by, bw, bd, result.Rooms, warnings);
@@ -228,15 +243,25 @@ namespace zHeight.Plugin.Solver
         private static void LayoutResidentialWing(
             List<ZoneGroup> zones,
             double bx, double by, double bw, double bd,
-            LayoutResult result, List<string> warnings)
+            LayoutResult result, List<string> warnings,
+            string strategy, string wingOrientation, string garagePlacement)
         {
             var all     = zones.SelectMany(z => z.Spaces).ToList();
             int floor   = all.Select(s => s.Floor).DefaultIfEmpty(1).Min();
             double sqm  = Math.Max(all.Sum(s => Math.Max(s.AreaSqm, 1.0)), 30.0);
 
-            // ── House footprint: 4:3 aspect ratio ─────────────────────────────
-            double mm2    = sqm * 1_000_000.0;
-            double houseW = SnapG(Math.Sqrt(mm2 * 4.0 / 3.0));
+            // ── House footprint: lot-responsive aspect ratio ──────────────────
+            double mm2       = sqm * 1_000_000.0;
+            double lotRatio  = bw / Math.Max(bd, 1.0);
+            double targetAsp = (strategy ?? "").ToLowerInvariant() switch
+            {
+                "ranch"         => Math.Min(2.8, lotRatio * 0.9),
+                "spine"         => 0.75,
+                "courtyard"     => 1.0,
+                "compact_urban" => 0.85,
+                _               => Math.Clamp(lotRatio * 0.70, 0.9, 1.8),
+            };
+            double houseW = SnapG(Math.Sqrt(mm2 * targetAsp));
             double houseD = SnapG(mm2 / Math.Max(houseW, STRUCT));
             houseW = Math.Clamp(houseW, STRUCT * 6, bw);
             houseD = Math.Clamp(houseD, STRUCT * 4, bd);
@@ -260,11 +285,14 @@ namespace zHeight.Plugin.Solver
             livWingW = Math.Max(livWingW, STRUCT * 3);
             bedWingW = houseW - hallW - livWingW;
 
-            // Living wing LEFT, hallway CENTRE, bedroom wing RIGHT
-            // (matches standard US suburban plan: living faces street-left, beds private-right)
-            double livX  = bx;
-            double hallX = bx + livWingW;
-            double bedX  = bx + livWingW + hallW;
+            // Wing orientation — "living_left" (default CA suburban) or "living_right"
+            bool livingOnLeft = !string.Equals(wingOrientation, "living_right",
+                                               StringComparison.OrdinalIgnoreCase);
+            double livX  = livingOnLeft ? bx                           : bx + bedWingW + hallW;
+            double hallX = livingOnLeft ? bx + livWingW                : bx + bedWingW;
+            double bedX  = livingOnLeft ? bx + livWingW + hallW        : bx;
+            // Bedroom outer wall faces east when living is left, west when living is right
+            string bedFacing = livingOnLeft ? "east" : "west";
 
             // ── Classify ─────────────────────────────────────────────────────
             var beds      = all.Where(s => BedTypes.Contains(s.Type))
@@ -293,9 +321,10 @@ namespace zHeight.Plugin.Solver
             var remBaths    = fullBaths.Where(b => b != primaryBath).ToList();
 
             // ── Bedroom wing row heights (scaled to fill houseD, capped at 1.15× standard) ──
+            // FIX-ARCH-03: secondary bedrooms first (near street/low-Y) → primary suite last (rear)
             var rawH = new List<double>();
-            if (primaryBed != null) rawH.Add(STRUCT * 4);   // ~16ft primary suite
-            foreach (var _ in secBeds)    rawH.Add(STRUCT * 3);   // ~12ft secondary
+            foreach (var _ in secBeds)    rawH.Add(STRUCT * 3);   // ~12ft secondary — near street
+            if (primaryBed != null)       rawH.Add(STRUCT * 4);   // ~16ft primary suite — at rear
 
             if (!rawH.Any()) rawH.Add(STRUCT * 4); // fallback if no beds classified
             double rawSum = rawH.Sum();
@@ -309,16 +338,38 @@ namespace zHeight.Plugin.Solver
             // in deep houses (e.g. 3 beds on a 120ft lot → each row scales to 40ft)
             double capPrimary = Snap(STRUCT * 4 * 1.15, GRID); // ≈5600mm
             double capSecond  = Snap(STRUCT * 3 * 1.15, GRID); // ≈4200mm
+            int primaryRowIdx = rowH.Count - 1; // primary suite is the last row
             for (int i = 0; i < rowH.Count; i++)
             {
-                double cap = (i == 0 && primaryBed != null) ? capPrimary : capSecond;
+                double cap = (i == primaryRowIdx && primaryBed != null) ? capPrimary : capSecond;
                 rowH[i] = Math.Min(rowH[i], cap);
             }
 
-            // ── Place bedroom wing ────────────────────────────────────────────
-            double bedY  = by;
-            int    ri    = 0;
+            // ── Place bedroom wing — secondary beds first, primary suite at rear ─
+            double bedY = by;
+            int    ri   = 0;
 
+            // Secondary bedrooms (near street — low Y)
+            for (int i = 0; i < secBeds.Count && ri < rowH.Count; i++, ri++)
+            {
+                double rh   = Math.Max(rowH[ri], MIN_DIM);
+                var    bath = i < remBaths.Count ? remBaths[i] : null;
+                double bw2  = bath != null ? Snap(bedWingW * 0.65, GRID) : bedWingW;
+                bw2 = Math.Max(bw2, MIN_DIM);
+
+                secBeds[i].Facing    = bedFacing;
+                secBeds[i].SolarWall = SolarWallForType(N(secBeds[i].Type));
+                Place(secBeds[i], bedX, bedY, bw2, rh, result.Rooms);
+                if (bath != null)
+                {
+                    bath.Facing    = bedFacing;
+                    bath.SolarWall = SolarWallForType(N(bath.Type));
+                    Place(bath, bedX + bw2, bedY, bedWingW - bw2, rh, result.Rooms);
+                }
+                bedY += rh;
+            }
+
+            // Primary suite at rear (highest Y — deepest privacy corner)
             if (primaryBed != null && ri < rowH.Count)
             {
                 double rh    = Math.Max(rowH[ri++], MIN_DIM);
@@ -329,43 +380,29 @@ namespace zHeight.Plugin.Solver
                 double bedW    = Snap(bedWingW * bedFrac, GRID);
                 double rem     = bedWingW - bedW;
 
-                primaryBed.Facing = "east"; // bedroom wing on right → east wall has windows
+                primaryBed.Facing    = bedFacing;
+                primaryBed.SolarWall = SolarWallForType(N(primaryBed.Type));
                 Place(primaryBed, bedX, bedY, bedW, rh, result.Rooms);
 
                 if (hasW && hasB)
                 {
                     double ww = Snap(rem * 0.5, GRID);
-                    primaryWic!.Facing  = "east";
-                    primaryBath!.Facing = "east";
+                    primaryWic!.Facing   = bedFacing;
+                    primaryBath!.Facing  = bedFacing;
+                    primaryBath.SolarWall = SolarWallForType(N(primaryBath.Type));
                     Place(primaryWic,  bedX + bedW,      bedY, ww,       rh, result.Rooms);
                     Place(primaryBath, bedX + bedW + ww, bedY, rem - ww, rh, result.Rooms);
                 }
                 else if (hasB)
                 {
-                    primaryBath!.Facing = "east";
+                    primaryBath!.Facing   = bedFacing;
+                    primaryBath.SolarWall = SolarWallForType(N(primaryBath.Type));
                     Place(primaryBath, bedX + bedW, bedY, rem, rh, result.Rooms);
                 }
                 else if (hasW)
                 {
-                    primaryWic!.Facing = "east";
+                    primaryWic!.Facing = bedFacing;
                     Place(primaryWic,  bedX + bedW, bedY, rem, rh, result.Rooms);
-                }
-                bedY += rh;
-            }
-
-            for (int i = 0; i < secBeds.Count && ri < rowH.Count; i++, ri++)
-            {
-                double rh   = Math.Max(rowH[ri], MIN_DIM);
-                var    bath = i < remBaths.Count ? remBaths[i] : null;
-                double bw2  = bath != null ? Snap(bedWingW * 0.65, GRID) : bedWingW;
-                bw2 = Math.Max(bw2, MIN_DIM);
-
-                secBeds[i].Facing = "east"; // bedroom wing on right, windows face east
-                Place(secBeds[i], bedX, bedY, bw2, rh, result.Rooms);
-                if (bath != null)
-                {
-                    bath.Facing = "east";
-                    Place(bath, bedX + bw2, bedY, bedWingW - bw2, rh, result.Rooms);
                 }
                 bedY += rh;
             }
@@ -393,9 +430,12 @@ namespace zHeight.Plugin.Solver
 
             // ── Living wing height budget ─────────────────────────────────────
             // From front (street) to rear (backyard):
-            //   Entry row → Open plan → Service strip → Enclair (glass room at rear) → Garage
-            var garages        = service.Where(s => s.Type == "garage").ToList();
-            var nonGarService  = service.Where(s => s.Type != "garage").ToList();
+            //   [Front garage if front-loaded] → Entry row → Open plan →
+            //   Service strip → Enclair (glass room at rear) → [Rear garage if rear-loaded]
+            var garages       = service.Where(s => s.Type == "garage").ToList();
+            var nonGarService = service.Where(s => s.Type != "garage").ToList();
+            bool garageFront  = garages.Any() &&
+                string.Equals(garagePlacement, "front", StringComparison.OrdinalIgnoreCase);
 
             double entryH    = Math.Max(Snap(houseD * 0.15, GRID), STRUCT * 2);
             double garageH   = garages.Any()
@@ -404,13 +444,37 @@ namespace zHeight.Plugin.Solver
                 ? Math.Max(Snap(houseD * 0.20, GRID), STRUCT * 3) : 0;
             double serviceH  = nonGarService.Any()
                 ? Math.Max(Snap(houseD * 0.15, GRID), STRUCT * 2) : 0;
-            double openH     = Math.Max(houseD - entryH - garageH - enclaireH - serviceH, STRUCT * 3);
+            double rearGarH  = garageFront ? 0 : garageH; // rear garage only when not front-loaded
+            double openH     = Math.Max(houseD - entryH - rearGarH - enclaireH - serviceH
+                                        - (garageFront ? garageH : 0), STRUCT * 3);
 
             // Correct so they sum exactly to houseD
-            serviceH = houseD - entryH - garageH - enclaireH - openH;
+            serviceH = houseD - entryH - rearGarH - enclaireH - openH
+                       - (garageFront ? garageH : 0);
             if (serviceH < 0) { openH += serviceH; serviceH = 0; }
 
             double livY = by;
+
+            // ── Front-loaded garage (street-facing, placed before entry) ──────
+            if (garageFront && garageH > 0)
+            {
+                double perW = Snap(livWingW / garages.Count, GRID);
+                double tmpX = livX;
+                for (int i = 0; i < garages.Count; i++)
+                {
+                    double w = (i == garages.Count - 1) ? livX + livWingW - tmpX : perW;
+                    w = Math.Max(w, MIN_DIM);
+                    garages[i].Facing = "south"; // faces street
+                    if (garages[i].AreaSqm > 30)
+                    {
+                        garages[i].ZoneName       = "adu_capable";
+                        garages[i].HasNaturalLight = true;
+                    }
+                    Place(garages[i], tmpX, livY, w, garageH, result.Rooms);
+                    tmpX += w;
+                }
+                livY += garageH;
+            }
 
             // ── Entry row (with optional half-bath side by side) ──────────────
             var entryRoom = entries.FirstOrDefault() ?? new SpaceNode
@@ -421,14 +485,12 @@ namespace zHeight.Plugin.Solver
 
             if (halfBaths.Any())
             {
-                // Half-bath beside entry, both in the entry row
                 double hbW = Snap(livWingW * 0.30, GRID);
                 double enW = livWingW - hbW;
                 entryRoom.Facing = "south";
-                Place(entryRoom,   livX,       livY, enW, entryH, result.Rooms);
+                Place(entryRoom,    livX,       livY, enW, entryH, result.Rooms);
                 halfBaths[0].Facing = "south";
                 Place(halfBaths[0], livX + enW, livY, hbW, entryH, result.Rooms);
-                // Any extra half-baths ignored (rare)
             }
             else
             {
@@ -437,24 +499,80 @@ namespace zHeight.Plugin.Solver
             }
             livY += entryH;
 
-            // ── Open living + kitchen (merged, facing backyard) ───────────────
+            // ── MISSING-01: Open-plan zone — individual rooms in sequence ────────
+            // Order (south→north, i.e. entry→backyard): living → dining → kitchen.
+            // Shared walls between them are suppressed at draw time via IsOpenPlan.
             double openArea = open.Any()
                 ? open.Sum(s => Math.Max(s.AreaSqm, 1.0))
                 : sqm * 0.30;
-            var openRoom = new SpaceNode
+
+            // Bucket incoming rooms by category
+            var livingBucket  = open.Where(s => s.Type is "living" or "living_room"
+                                               or "great_room" or "family_room"
+                                               or "open_living").ToList();
+            var diningBucket  = open.Where(s => s.Type is "dining" or "dining_room"
+                                               or "breakfast_nook" or "kitchen_dining").ToList();
+            var kitchenBucket = open.Where(s => s.Type is "kitchen" or "open_kitchen"
+                                               or "open_plan").ToList();
+
+            // Remaining unclassified open rooms go to living
+            var classified = livingBucket.Concat(diningBucket).Concat(kitchenBucket)
+                                         .ToHashSet();
+            livingBucket.AddRange(open.Where(s => !classified.Contains(s)));
+
+            // If Gemini sent no individual rooms, synthesise proportional split
+            if (!livingBucket.Any() && !diningBucket.Any() && !kitchenBucket.Any())
             {
-                Name = "Open Living & Kitchen", Type = "open_plan",
-                ZoneName = "centre", Floor = floor,
-                HasNaturalLight = true, Facing = "north", // faces backyard
-                MinWidthM = 4.5, MinDepthM = 4.0, AreaSqm = openArea,
-            };
-            Place(openRoom, livX, livY, livWingW, openH, result.Rooms);
+                livingBucket.Add(new SpaceNode  { Name = "Living Room",  Type = "living_room",
+                    Floor = floor, HasNaturalLight = true, AreaSqm = openArea * 0.40 });
+                diningBucket.Add(new SpaceNode  { Name = "Dining Room",  Type = "dining_room",
+                    Floor = floor, HasNaturalLight = true, AreaSqm = openArea * 0.25 });
+                kitchenBucket.Add(new SpaceNode { Name = "Kitchen",       Type = "kitchen",
+                    Floor = floor, HasNaturalLight = true, AreaSqm = openArea * 0.35 });
+            }
+
+            // Merge each bucket into a single node; skip null (empty bucket)
+            var openSeq = new List<SpaceNode>();
+            SpaceNode? Merge(List<SpaceNode> bucket, string dName, string dType)
+            {
+                if (!bucket.Any()) return null;
+                if (bucket.Count == 1) return bucket[0];
+                return new SpaceNode { Name = dName, Type = dType,
+                    Floor = bucket[0].Floor, HasNaturalLight = true,
+                    AreaSqm = bucket.Sum(r => Math.Max(r.AreaSqm, 1.0)) };
+            }
+            var lNode = Merge(livingBucket,  "Living Room", "living_room");
+            var dNode = Merge(diningBucket,  "Dining Room", "dining_room");
+            var kNode = Merge(kitchenBucket, "Kitchen",     "kitchen");
+            foreach (var n in new[] { lNode, dNode, kNode })
+                if (n != null) openSeq.Add(n);
+
+            double totalOpenArea = openSeq.Sum(n => n.AreaSqm) < 0.01
+                ? openArea : openSeq.Sum(n => Math.Max(n.AreaSqm, 1.0));
+            double curLivY = livY;
+            for (int i = 0; i < openSeq.Count; i++)
+            {
+                var node = openSeq[i];
+                double frac   = totalOpenArea > 0 ? node.AreaSqm / totalOpenArea : 1.0 / openSeq.Count;
+                double roomH  = (i == openSeq.Count - 1)
+                    ? livY + openH - curLivY
+                    : Snap(openH * frac, GRID);
+                roomH = Math.Max(roomH, MIN_DIM);
+                node.IsOpenPlan = true;
+                node.ZoneName   = "open_plan";
+                node.Facing     = "north";
+                // MISSING-02: primary axis — living faces entry (south glazing),
+                //             kitchen faces enclair/backyard (north glazing).
+                node.SolarWall  = SolarWallForType(N(node.Type));
+                Place(node, livX, curLivY, livWingW, roomH, result.Rooms);
+                curLivY += roomH;
+            }
             livY += openH;
 
             // ── Service row (non-garage, side by side above enclair/garage) ────
             if (nonGarService.Any() && serviceH > 0)
             {
-                double svcY = by + houseD - serviceH - enclaireH - garageH;
+                double svcY = by + houseD - serviceH - enclaireH - rearGarH;
                 double perW = Snap(livWingW / nonGarService.Count, GRID);
                 double tmpX = livX;
                 for (int i = 0; i < nonGarService.Count; i++)
@@ -469,10 +587,9 @@ namespace zHeight.Plugin.Solver
             }
 
             // ── Enclair / covered outdoor room (glass-walled, rear of living wing) ──
-            // Placed at the very rear of the living wing, opening to the backyard.
             if (enclairs.Any() && enclaireH > 0)
             {
-                double encY = by + houseD - enclaireH - garageH;
+                double encY = by + houseD - enclaireH - rearGarH;
                 double perW = Snap(livWingW / enclairs.Count, GRID);
                 double tmpX = livX;
                 for (int i = 0; i < enclairs.Count; i++)
@@ -480,7 +597,7 @@ namespace zHeight.Plugin.Solver
                     double w = (i == enclairs.Count - 1)
                         ? livX + livWingW - tmpX : perW;
                     w = Math.Max(w, MIN_DIM);
-                    enclairs[i].Facing         = "north"; // glass wall faces backyard
+                    enclairs[i].Facing         = "north";
                     enclairs[i].HasNaturalLight = true;
                     enclairs[i].ZoneName        = "enclair";
                     Place(enclairs[i], tmpX, encY, w, enclaireH, result.Rooms);
@@ -488,10 +605,10 @@ namespace zHeight.Plugin.Solver
                 }
             }
 
-            // ── Garage row (full living-wing width, at very rear) ─────────────
-            if (garages.Any() && garageH > 0)
+            // ── Rear-loaded garage (alley access, at very rear of living wing) ─
+            if (!garageFront && garages.Any() && rearGarH > 0)
             {
-                double garY = by + houseD - garageH;
+                double garY = by + houseD - rearGarH;
                 double perW = Snap(livWingW / garages.Count, GRID);
                 double tmpX = livX;
                 for (int i = 0; i < garages.Count; i++)
@@ -500,13 +617,12 @@ namespace zHeight.Plugin.Solver
                         ? livX + livWingW - tmpX : perW;
                     w = Math.Max(w, MIN_DIM);
                     garages[i].Facing = "north";
-                    // Mark oversized garage as ADU-capable
                     if (garages[i].AreaSqm > 30)
                     {
                         garages[i].ZoneName       = "adu_capable";
                         garages[i].HasNaturalLight = true;
                     }
-                    Place(garages[i], tmpX, garY, w, garageH, result.Rooms);
+                    Place(garages[i], tmpX, garY, w, rearGarH, result.Rooms);
                     tmpX += w;
                 }
             }
@@ -668,6 +784,25 @@ namespace zHeight.Plugin.Solver
             result.AddRange(others);
             return result;
         }
+
+        // MISSING-03: return the preferred solar-glazing wall for a room type.
+        // Empty string means "use Facing" (no solar override).
+        private static string SolarWallForType(string t) => t switch
+        {
+            "living_room"  or "living"  or "great_room" or "family_room"
+                or "open_living"                                              => "south",
+            "dining_room"  or "dining"  or "breakfast_nook"                  => "south",
+            "kitchen"      or "open_kitchen"                                  => "north",
+            "primary_bedroom" or "primary_suite" or "master_bedroom"         => "east",
+            "secondary_bedroom" or "bedroom" or "guest_bedroom"
+                or "home_office_bedroom"                                      => "east",
+            "bathroom" or "primary_bath" or "ensuite_bath" or "ensuite"
+                or "master_bath" or "secondary_bath" or "shared_bath"
+                or "full_bath"                                                => "north",
+            "powder_room"  or "half_bath" or "toilet"                        => "north",
+            "entry"        or "foyer"    or "entry_foyer" or "vestibule"      => "south",
+            _                                                                  => "",
+        };
 
         private static bool NeedsCorridor(string prev, string next) =>
             prev is "centre" or "front" && next is "rear" or "service";
