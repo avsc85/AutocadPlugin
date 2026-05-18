@@ -545,11 +545,17 @@ INSTRUCTIONS:
    enclair, sunroom, covered_porch, laundry, mudroom, garage, pantry.
 4. Kitchen + dining + living MUST be in ONE zone with zone_position "centre".
 5. Do NOT add hallway, corridor, backyard, yard, garden, or any outdoor space.
-6. Variation 2: use organisation_type "split_wing", organisation_strategy "split_wing" —
-   Y-shaped plan: open living core at front (full stem width), bedroom wing and service wing
-   diverging at rear. Consider "living_right" wing_orientation if solar context suits it.
-7. Variation 3: use organisation_type "compact_urban", organisation_strategy "spine" —
-   tight footprint, efficiency-first, compact bedroom wing.
+6. MANDATORY VARIATION STRATEGIES — all three MUST use a different organisation_strategy:
+   Variation 1: organisation_type "open_plan_suburban", organisation_strategy "residential",
+     wing_orientation "living_left" — standard wing: living LEFT, bedrooms RIGHT.
+   Variation 2: organisation_type "split_wing", organisation_strategy "split_wing",
+     wing_orientation "living_right" — T-shape: full-width open plan at front, bedroom
+     wing and service wing diverging at rear with solar diversity.
+   Variation 3: organisation_type "ranch", organisation_strategy "ranch",
+     wing_orientation "living_left" — wide shallow single-strip, 2:1+ W:D ratio,
+     all rooms in horizontal bands from street to backyard.
+   Any variation with identical organisation_strategy to another is INVALID output.
+7. Each variation MUST have a different concept_name and concept_rationale.
 8. Each variation should adjust room count and sizes to reflect the brief.
 9. MANDATORY — use key "zones" (NOT "spaces") at the variation level. The layout engine
    will FAIL SILENTLY if you emit "spaces" instead of "zones" at variation level.

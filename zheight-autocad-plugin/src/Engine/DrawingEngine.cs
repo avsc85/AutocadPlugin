@@ -827,8 +827,22 @@ namespace zHeight.Plugin.Engine
             double hw_mm    = room.WidthMm / 2;
             double hd_mm    = room.DepthMm / 2;
 
+            // Bedrooms, bathrooms, closets: door faces hallway = OPPOSITE of window/exterior facing.
+            // All other rooms: door on the facing wall (entry side).
+            string rt = (room.Type ?? "").ToLowerInvariant().Replace("-", "_").Replace(" ", "_");
+            bool isBedOrBath = rt.Contains("bedroom") || rt.Contains("bath") || rt.Contains("closet")
+                               || rt is "walk_in_closet" or "wic" or "ensuite" or "ensuite_bath";
+            string doorFacing = isBedOrBath
+                ? room.Facing switch {
+                    "east"  => "west",
+                    "west"  => "east",
+                    "north" => "south",
+                    "south" => "north",
+                    _       => room.Facing }
+                : room.Facing;
+
             double px_mm, py_mm;
-            switch (room.Facing)
+            switch (doorFacing)
             {
                 case "north":
                     px_mm = room.X + hw_mm - doorW_mm / 2;
@@ -852,9 +866,9 @@ namespace zHeight.Plugin.Engine
             double doorW_du = doorW_mm * _s;
 
             // Door leaf and arc — swing direction from DoorSwingRule (architectural convention)
-            var (swingStart, swingEnd) = DoorSwingRule(room.Type, room.Facing);
+            var (swingStart, swingEnd) = DoorSwingRule(room.Type, doorFacing);
             Line leaf; Arc arc;
-            switch (room.Facing)
+            switch (doorFacing)
             {
                 case "north":
                     leaf = new Line(pos, new Point3d(pos.X + doorW_du, pos.Y, 0));

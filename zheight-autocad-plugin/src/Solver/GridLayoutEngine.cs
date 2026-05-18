@@ -260,9 +260,12 @@ namespace zHeight.Plugin.Solver
 
             // Compute minimum houseD required so every vertical strip has architectural clearance.
             // This prevents targetAsp from making the house too shallow to fit its own zones.
-            bool hasEnclair = all.Any(s => EnclaireTypes.Contains(s.Type));
-            bool hasGarage  = all.Any(s => s.Type == "garage");
-            bool hasSvc     = all.Any(s => ServiceTypes.Contains(s.Type) && s.Type != "garage");
+            bool hasEnclair     = all.Any(s => EnclaireTypes.Contains(s.Type));
+            bool hasGarage      = all.Any(s => s.Type == "garage");
+            bool hasSvc         = all.Any(s => ServiceTypes.Contains(s.Type) && s.Type != "garage");
+            bool hasPrimaryBath = all.Any(s => s.Type is "primary_bath" or "ensuite_bath"
+                                               or "master_bath" or "ensuite");
+            bool hasWicRoom     = all.Any(s => ClosetTypes.Contains(s.Type));
             double minHouseD = 1500               // entry foyer
                 + 6000                            // open-plan living zone minimum (20 ft)
                 + (hasEnclair ? 2400 : 0)         // covered porch/enclair
@@ -270,6 +273,13 @@ namespace zHeight.Plugin.Solver
                 + (hasGarage  ? 5400 : 0);        // garage
             // maxAsp: highest W:D ratio that still gives minHouseD
             double maxAsp = mm2 / Math.Max(minHouseD * minHouseD, 1.0);
+
+            // Compute minimum houseW so the bedroom wing can fit the primary suite side-by-side.
+            // primary bed (2700mm) + WIC (1500mm) + bath (1524mm) must fit in bedWingW.
+            double minBedWingW = 2700
+                + (hasWicRoom     ? 1500 : 0)
+                + (hasPrimaryBath ? 1524 : 0);
+            double minWingW = minBedWingW + HALLWAY + STRUCT * 4;  // bed + hall + min living
 
             double targetAsp = strat switch
             {
@@ -279,8 +289,8 @@ namespace zHeight.Plugin.Solver
                 "courtyard"                      => 1.0,
                 _                                => Math.Min(1.7, maxAsp),  // never shallower than zones need
             };
-            // 9000mm (30 ft) minimum width — wing layout cannot resolve below this
-            double houseW = Math.Max(SnapG(Math.Sqrt(mm2 * targetAsp)), 9000);
+            // minimum: 9000mm (30ft) OR width needed to fit all wing suites
+            double houseW = Math.Max(SnapG(Math.Sqrt(mm2 * targetAsp)), Math.Max(9000.0, minWingW));
             double houseD = SnapG(mm2 / Math.Max(houseW, STRUCT));
             houseW = Math.Clamp(houseW, STRUCT * 6, bw);
             houseD = Math.Clamp(houseD, STRUCT * 4, bd);
@@ -297,8 +307,9 @@ namespace zHeight.Plugin.Solver
             double hallW     = HALLWAY;
             double livWingW  = SnapG(houseW * livFrac);
             double bedWingW  = houseW - hallW - livWingW;
-            bedWingW = Math.Max(bedWingW, STRUCT * 4);
-            // Re-derive livWingW after clamping bedWingW to avoid under-sizing
+            // Bedroom wing must be wide enough for primary suite (bed+WIC+bath side-by-side)
+            bedWingW = Math.Max(bedWingW, Math.Max(STRUCT * 4, minBedWingW));
+            // Re-derive livWingW after clamping bedWingW
             livWingW = houseW - hallW - bedWingW;
             if (livWingW < STRUCT * 3)
             {
