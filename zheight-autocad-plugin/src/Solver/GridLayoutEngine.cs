@@ -592,10 +592,10 @@ namespace zHeight.Plugin.Solver
             bool useLateral = lNode != null && (dNode != null || kNode != null);
             if (useLateral)
             {
-                double livFrac = totalOpenArea > 0 && lNode!.AreaSqm > 0
+                double openLivFrac = totalOpenArea > 0 && lNode!.AreaSqm > 0
                     ? lNode.AreaSqm / totalOpenArea : 0.55;
-                livFrac = Math.Clamp(livFrac, 0.45, 0.65);
-                double frontH = Snap(openH * livFrac, GRID);
+                openLivFrac = Math.Clamp(openLivFrac, 0.45, 0.65);
+                double frontH = Snap(openH * openLivFrac, GRID);
                 frontH = Math.Max(frontH, STRUCT * 3);
                 double rearH  = openH - frontH;
                 rearH  = Math.Max(rearH, STRUCT * 2);
