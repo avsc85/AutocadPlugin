@@ -253,19 +253,33 @@ namespace zHeight.Plugin.Solver
             int floor   = all.Select(s => s.Floor).DefaultIfEmpty(1).Min();
             double sqm  = Math.Max(all.Sum(s => Math.Max(s.AreaSqm, 1.0)), 30.0);
 
-            // ── House footprint: lot-responsive aspect ratio ──────────────────
+            // ── House footprint: depth-adaptive aspect ratio ──────────────────
             double mm2      = sqm * 1_000_000.0;
             double lotRatio = bw / Math.Max(bd, 1.0);
             string strat    = (strategy ?? "").ToLowerInvariant();
+
+            // Compute minimum houseD required so every vertical strip has architectural clearance.
+            // This prevents targetAsp from making the house too shallow to fit its own zones.
+            bool hasEnclair = all.Any(s => EnclaireTypes.Contains(s.Type));
+            bool hasGarage  = all.Any(s => s.Type == "garage");
+            bool hasSvc     = all.Any(s => ServiceTypes.Contains(s.Type) && s.Type != "garage");
+            double minHouseD = 1500               // entry foyer
+                + 6000                            // open-plan living zone minimum (20 ft)
+                + (hasEnclair ? 2400 : 0)         // covered porch/enclair
+                + (hasSvc     ? 2100 : 0)         // laundry/utility strip
+                + (hasGarage  ? 5400 : 0);        // garage
+            // maxAsp: highest W:D ratio that still gives minHouseD
+            double maxAsp = mm2 / Math.Max(minHouseD * minHouseD, 1.0);
+
             double targetAsp = strat switch
             {
-                var s when s.Contains("ranch")   => Math.Min(2.8, lotRatio * 0.9),
+                var s when s.Contains("ranch")   => Math.Min(2.2, lotRatio * 0.9),
                 var s when s.Contains("compact") => 1.0,
                 var s when s.Contains("spine")   => 0.8,
                 "courtyard"                      => 1.0,
-                _                                => 1.7,  // wide+shallow suburban default (was 1.4)
+                _                                => Math.Min(1.7, maxAsp),  // never shallower than zones need
             };
-            // 9000mm (30 ft) minimum — wing layout cannot resolve below this width
+            // 9000mm (30 ft) minimum width — wing layout cannot resolve below this
             double houseW = Math.Max(SnapG(Math.Sqrt(mm2 * targetAsp)), 9000);
             double houseD = SnapG(mm2 / Math.Max(houseW, STRUCT));
             houseW = Math.Clamp(houseW, STRUCT * 6, bw);
@@ -473,9 +487,9 @@ namespace zHeight.Plugin.Solver
             double garageH   = garages.Any()
                 ? Math.Max(Snap(houseD * 0.22, GRID), 6096.0) : 0;
             double enclaireH = enclairs.Any()
-                ? Math.Max(Snap(houseD * 0.20, GRID), STRUCT * 3) : 0;
+                ? Math.Clamp(Snap(houseD * 0.22, GRID), 2400, 3000) : 0;  // 8–10 ft covered porch
             double serviceH  = nonGarService.Any()
-                ? Math.Max(Snap(houseD * 0.15, GRID), STRUCT * 2) : 0;
+                ? Math.Clamp(Snap(houseD * 0.15, GRID), 2100, 2700) : 0;  // 7–9 ft utility strip
             double rearGarH  = garageFront ? 0 : garageH; // rear garage only when not front-loaded
             double openH     = Math.Max(houseD - entryH - rearGarH - enclaireH - serviceH
                                         - (garageFront ? garageH : 0), STRUCT * 3);
@@ -517,15 +531,20 @@ namespace zHeight.Plugin.Solver
                 Floor = floor, HasNaturalLight = true, Facing = "south",
             };
 
-            double entryW = Snap(livWingW * 0.40, GRID);
-            entryW = Math.Max(entryW, STRUCT * 2);  // at least 8 ft wide
-            entryRoom.Facing = "south";
-            Place(entryRoom, livX, livY, entryW, entryH, result.Rooms);
-
+            // Powder room: max 1500mm (5 ft) wide — entry expands to fill the rest of the row
             if (halfBaths.Any())
             {
+                double pbW = Math.Clamp(Snap(livWingW * 0.15, GRID), 900, 1500);
+                double enW = livWingW - pbW;
+                entryRoom.Facing = "south";
+                Place(entryRoom,    livX,       livY, enW, entryH, result.Rooms);
                 halfBaths[0].Facing = "south";
-                Place(halfBaths[0], livX + entryW, livY, livWingW - entryW, entryH, result.Rooms);
+                Place(halfBaths[0], livX + enW, livY, pbW, entryH, result.Rooms);
+            }
+            else
+            {
+                entryRoom.Facing = "south";
+                Place(entryRoom, livX, livY, livWingW, entryH, result.Rooms);
             }
             livY += entryH;
 
@@ -657,20 +676,22 @@ namespace zHeight.Plugin.Solver
             }
             livY += openH;
 
-            // ── Service row (non-garage, side by side above enclair/garage) ────
+            // ── Service row (non-garage, area-proportional widths) ───────────
             if (nonGarService.Any() && serviceH > 0)
             {
-                double svcY = by + houseD - serviceH - enclaireH - rearGarH;
-                double perW = Snap(livWingW / nonGarService.Count, GRID);
-                double tmpX = livX;
+                double svcY        = by + houseD - serviceH - enclaireH - rearGarH;
+                double svcX        = livX;
+                double totalSvcArea = nonGarService.Sum(s => Math.Max(s.AreaSqm, 1.0));
                 for (int i = 0; i < nonGarService.Count; i++)
                 {
-                    double w = (i == nonGarService.Count - 1)
-                        ? livX + livWingW - tmpX : perW;
+                    double frac = nonGarService[i].AreaSqm / totalSvcArea;
+                    double w    = (i == nonGarService.Count - 1)
+                        ? livX + livWingW - svcX   // last room fills remainder exactly
+                        : Math.Clamp(Snap(livWingW * frac, GRID), 1800, 4200);
                     w = Math.Max(w, MIN_DIM);
                     nonGarService[i].Facing = "north";
-                    Place(nonGarService[i], tmpX, svcY, w, serviceH, result.Rooms);
-                    tmpX += w;
+                    Place(nonGarService[i], svcX, svcY, w, serviceH, result.Rooms);
+                    svcX += w;
                 }
             }
 
