@@ -254,17 +254,19 @@ namespace zHeight.Plugin.Solver
             double sqm  = Math.Max(all.Sum(s => Math.Max(s.AreaSqm, 1.0)), 30.0);
 
             // ── House footprint: lot-responsive aspect ratio ──────────────────
-            double mm2       = sqm * 1_000_000.0;
-            double lotRatio  = bw / Math.Max(bd, 1.0);
-            double targetAsp = (strategy ?? "").ToLowerInvariant() switch
+            double mm2      = sqm * 1_000_000.0;
+            double lotRatio = bw / Math.Max(bd, 1.0);
+            string strat    = (strategy ?? "").ToLowerInvariant();
+            double targetAsp = strat switch
             {
-                "ranch"         => Math.Min(2.8, lotRatio * 0.9),
-                "spine"         => 0.75,
-                "courtyard"     => 1.0,
-                "compact_urban" => 0.85,
-                _               => Math.Clamp(lotRatio * 0.70, 0.9, 1.8),
+                var s when s.Contains("ranch")   => Math.Min(2.8, lotRatio * 0.9),
+                var s when s.Contains("compact") => 1.0,
+                var s when s.Contains("spine")   => 0.8,
+                "courtyard"                      => 1.0,
+                _                                => 1.7,  // wide+shallow suburban default (was 1.4)
             };
-            double houseW = SnapG(Math.Sqrt(mm2 * targetAsp));
+            // 9000mm (30 ft) minimum — wing layout cannot resolve below this width
+            double houseW = Math.Max(SnapG(Math.Sqrt(mm2 * targetAsp)), 9000);
             double houseD = SnapG(mm2 / Math.Max(houseW, STRUCT));
             houseW = Math.Clamp(houseW, STRUCT * 6, bw);
             houseD = Math.Clamp(houseD, STRUCT * 4, bd);
@@ -275,14 +277,19 @@ namespace zHeight.Plugin.Solver
             result.BuildingD = houseD;
 
             // ── Wing widths ───────────────────────────────────────────────────
-            double bedWingW = SnapG(houseW * 0.45);
+            // Living zone dominates for compact plans: 62% for ≤2 bed, 55% for 3+ bed
+            int bedCount     = all.Count(s => BedTypes.Contains(s.Type));
+            double livFrac   = bedCount <= 2 ? 0.62 : 0.55;
+            double hallW     = HALLWAY;
+            double livWingW  = SnapG(houseW * livFrac);
+            double bedWingW  = houseW - hallW - livWingW;
             bedWingW = Math.Max(bedWingW, STRUCT * 4);
-            double hallW    = HALLWAY;
-            double livWingW = houseW - bedWingW - hallW;
+            // Re-derive livWingW after clamping bedWingW to avoid under-sizing
+            livWingW = houseW - hallW - bedWingW;
             if (livWingW < STRUCT * 3)
             {
-                bedWingW = SnapG(houseW * 0.40);
-                livWingW = houseW - bedWingW - hallW;
+                bedWingW = SnapG(houseW * (1.0 - livFrac) + 0.02);  // concede 2% to beds
+                livWingW = houseW - hallW - bedWingW;
                 warnings.Add("Bedroom wing narrowed to fit living wing");
             }
             livWingW = Math.Max(livWingW, STRUCT * 3);
@@ -352,25 +359,30 @@ namespace zHeight.Plugin.Solver
             double bedY = by;
             int    ri   = 0;
 
-            // Secondary bedrooms (near street — low Y)
+            // Secondary bedrooms (near street — low Y) + paired bath on same row
+            // Bath: 35% of wing width (min 1500mm/5ft), Bed: 65% (min 2700mm/9ft)
             for (int i = 0; i < secBeds.Count && ri < rowH.Count; i++, ri++)
             {
                 double rh   = Math.Max(rowH[ri], MIN_DIM);
                 var    bath = i < remBaths.Count ? remBaths[i] : null;
-                double bw2  = bath != null ? Snap(bedWingW * 0.65, GRID) : bedWingW;
-                if (bath != null)
-                    bw2 = ClampAspectRatio(bw2, rh, 0.65, 1.35, MIN_DIM, bedWingW - MIN_DIM);
-                bw2 = Math.Max(bw2, MIN_DIM);
 
                 secBeds[i].Facing    = bedFacing;
                 secBeds[i].SolarWall = SolarWallForType(N(secBeds[i].Type));
-                Place(secBeds[i], bedX, bedY, bw2, rh, result.Rooms);
+
                 if (bath != null)
                 {
+                    double bathW = Math.Max(Snap(bedWingW * 0.35, GRID), 1500);
+                    double bedW  = Math.Max(bedWingW - bathW, 2700);
+                    // Re-clamp: ensure sum still equals bedWingW
+                    bathW = bedWingW - bedW;
+                    Place(secBeds[i], bedX,         bedY, bedW,  rh, result.Rooms);
                     bath.Facing    = bedFacing;
                     bath.SolarWall = SolarWallForType(N(bath.Type));
-                    Place(bath, bedX + bw2, bedY, bedWingW - bw2, rh, result.Rooms);
+                    Place(bath,       bedX + bedW,   bedY, bathW, rh, result.Rooms);
                 }
+                else
+                    Place(secBeds[i], bedX, bedY, bedWingW, rh, result.Rooms);
+
                 bedY += rh;
             }
 
@@ -457,7 +469,7 @@ namespace zHeight.Plugin.Solver
             bool garageFront  = garages.Any() &&
                 string.Equals(garagePlacement, "front", StringComparison.OrdinalIgnoreCase);
 
-            double entryH    = Math.Max(Snap(houseD * 0.15, GRID), STRUCT * 2);
+            double entryH    = Math.Min(Snap(houseD * 0.18, GRID), 2400);  // 8 ft max — transitional foyer only
             double garageH   = garages.Any()
                 ? Math.Max(Snap(houseD * 0.22, GRID), 6096.0) : 0;
             double enclaireH = enclairs.Any()
@@ -496,26 +508,24 @@ namespace zHeight.Plugin.Solver
                 livY += garageH;
             }
 
-            // ── Entry row (with optional half-bath side by side) ──────────────
+            // ── Entry row — small transitional foyer at street face ──────────
+            // Entry: 40% of living wing width, max 2400mm deep (8 ft)
+            // Powder room (or remaining space) fills the other 60% beside it
             var entryRoom = entries.FirstOrDefault() ?? new SpaceNode
             {
                 Name = "Entry", Type = "entry", ZoneName = "circulation",
                 Floor = floor, HasNaturalLight = true, Facing = "south",
             };
 
+            double entryW = Snap(livWingW * 0.40, GRID);
+            entryW = Math.Max(entryW, STRUCT * 2);  // at least 8 ft wide
+            entryRoom.Facing = "south";
+            Place(entryRoom, livX, livY, entryW, entryH, result.Rooms);
+
             if (halfBaths.Any())
             {
-                double hbW = Snap(livWingW * 0.30, GRID);
-                double enW = livWingW - hbW;
-                entryRoom.Facing = "south";
-                Place(entryRoom,    livX,       livY, enW, entryH, result.Rooms);
                 halfBaths[0].Facing = "south";
-                Place(halfBaths[0], livX + enW, livY, hbW, entryH, result.Rooms);
-            }
-            else
-            {
-                entryRoom.Facing = "south";
-                Place(entryRoom, livX, livY, livWingW, entryH, result.Rooms);
+                Place(halfBaths[0], livX + entryW, livY, livWingW - entryW, entryH, result.Rooms);
             }
             livY += entryH;
 
@@ -665,21 +675,22 @@ namespace zHeight.Plugin.Solver
             }
 
             // ── Enclair / covered outdoor room (glass-walled, rear of living wing) ──
+            // Single enclair must span exactly livWingW — rear wall continuation of living zone
             if (enclairs.Any() && enclaireH > 0)
             {
                 double encY = by + houseD - enclaireH - rearGarH;
-                double perW = Snap(livWingW / enclairs.Count, GRID);
-                double tmpX = livX;
+                double encW = enclairs.Count == 1
+                    ? livWingW
+                    : Snap(livWingW / enclairs.Count, GRID);
                 for (int i = 0; i < enclairs.Count; i++)
                 {
                     double w = (i == enclairs.Count - 1)
-                        ? livX + livWingW - tmpX : perW;
+                        ? livX + livWingW - (livX + i * encW) : encW;
                     w = Math.Max(w, MIN_DIM);
                     enclairs[i].Facing         = "north";
                     enclairs[i].HasNaturalLight = true;
                     enclairs[i].ZoneName        = "enclair";
-                    Place(enclairs[i], tmpX, encY, w, enclaireH, result.Rooms);
-                    tmpX += w;
+                    Place(enclairs[i], livX + i * encW, encY, w, enclaireH, result.Rooms);
                 }
             }
 

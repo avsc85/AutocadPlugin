@@ -488,17 +488,17 @@ class ActionCompiler:
 ROOM_AREA_LIMITS: dict[str, tuple[float, float]] = {
     "entry":             (2.0,  14.0),
     "foyer":             (2.0,  14.0),
-    "powder_room":       (1.5,   4.5),
-    "half_bath":         (1.5,   4.5),
-    "toilet":            (1.2,   4.0),
-    "bathroom":          (3.0,  12.0),
-    "primary_bath":      (4.0,  20.0),
-    "ensuite_bath":      (4.0,  20.0),
-    "master_bath":       (4.0,  20.0),
-    "secondary_bath":    (3.0,  10.0),
-    "shared_bath":       (3.0,  10.0),
-    "full_bath":         (3.0,  12.0),
-    "walk_in_closet":    (3.0,  16.0),
+    "powder_room":       (1.5,   2.8),   # 3'×6' max — half-bath, not a full bath
+    "half_bath":         (1.5,   2.8),
+    "toilet":            (1.2,   2.8),
+    "bathroom":          (3.5,   5.5),   # 5'×8'–6'×9' US shared bath
+    "primary_bath":      (4.5,   7.5),   # 6'×8'–8'×10' primary en-suite
+    "ensuite_bath":      (4.5,   7.5),
+    "master_bath":       (4.5,   7.5),
+    "secondary_bath":    (3.5,   5.0),   # same as shared_bath
+    "shared_bath":       (3.5,   5.0),
+    "full_bath":         (3.5,   5.5),
+    "walk_in_closet":    (3.0,   6.0),   # WIC is a closet, not a room
     "closet":            (1.5,   8.0),
     "wic":               (3.0,  16.0),
     "dressing_room":     (4.0,  18.0),

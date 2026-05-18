@@ -158,7 +158,10 @@ namespace zHeight.Plugin.Engine
 
                     var zones = ParseZones(variation);
                     // F-01: prefer typed Layout fields; fall back to Properties dict
+                    // OrganisationType is the fallback when Gemini emits organisation_type
+                    // without a matching organisation_strategy (activates split_wing path)
                     string strat = variation.Layout?.OrganisationStrategy
+                        ?? variation.Layout?.OrganisationType
                         ?? variation.Properties?.GetValueOrDefault("organisation_strategy", "residential")?.ToString()
                         ?? "residential";
                     double gridM = variation.Layout?.StructuralGridM

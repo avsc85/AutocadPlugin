@@ -241,8 +241,10 @@ REQUIRED SPACE METADATA — every space object inside zones must include:
     kitchen (L_shape) → preferred_width_m: 2.7, preferred_depth_m: 3.6, max_width_m: 5.5
     living_room → preferred_width_m: 4.2, preferred_depth_m: 5.5, max_width_m: 9.0
     dining → preferred_width_m: 3.0, preferred_depth_m: 3.6, max_width_m: 6.0
-    primary_bath → preferred_width_m: 1.83, preferred_depth_m: 2.44, max_width_m: 3.5
-    bathroom → preferred_width_m: 1.52, preferred_depth_m: 2.44, max_width_m: 2.8
+    primary_bath → preferred_width_m: 1.83, preferred_depth_m: 2.44, max_width_m: 2.74
+    bathroom → preferred_width_m: 1.52, preferred_depth_m: 2.44, max_width_m: 2.1
+    powder_room → preferred_width_m: 0.91, preferred_depth_m: 1.83, max_width_m: 1.52
+    walk_in_closet → preferred_width_m: 1.52, preferred_depth_m: 1.83, max_width_m: 2.44
 
 ADJACENCY RULES — enforce in every variation:
 - kitchen must list dining or living in its adjacency
@@ -511,10 +513,10 @@ Generate exactly 3 layout variations. Output this JSON structure exactly:
           "spaces": [
             {{"name": "Bedroom 2", "type": "secondary_bedroom", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "private", "adjacency": {{"connected_to": ["bathroom"], "near": ["hallway"], "separated_from": ["garage", "entry"]}}}},
             {{"name": "Bedroom 3", "type": "secondary_bedroom", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "private", "adjacency": {{"connected_to": ["bathroom"], "near": ["hallway"], "separated_from": ["garage", "entry"]}}}},
-            {{"name": "Bath 2", "type": "bathroom", "area_sqm": 3.7, "floor": 1, "has_natural_light": false, "privacy_level": "private", "adjacency": {{"connected_to": ["secondary_bedroom"], "near": [], "separated_from": []}}}},
+            {{"name": "Bath 2", "type": "bathroom", "area_sqm": 3.7, "floor": 1, "has_natural_light": false, "privacy_level": "private", "preferred_width_m": 1.52, "preferred_depth_m": 2.44, "max_width_m": 2.1, "adjacency": {{"connected_to": ["secondary_bedroom"], "near": [], "separated_from": []}}}},
             {{"name": "Primary Suite", "type": "primary_bedroom", "area_sqm": 18.0, "floor": 1, "has_natural_light": true, "privacy_level": "private", "preferred_width_m": 3.66, "preferred_depth_m": 4.12, "max_width_m": 6.0, "adjacency": {{"connected_to": ["primary_bath", "walk_in_closet"], "near": [], "separated_from": ["garage", "entry", "great_room", "foyer"]}}}},
-            {{"name": "Walk-In Closet", "type": "walk_in_closet", "area_sqm": 4.5, "floor": 1, "has_natural_light": false, "privacy_level": "private", "adjacency": {{"connected_to": ["primary_bedroom"], "near": [], "separated_from": []}}}},
-            {{"name": "Primary Bath", "type": "primary_bath", "area_sqm": 4.5, "floor": 1, "has_natural_light": false, "privacy_level": "private", "adjacency": {{"connected_to": ["primary_bedroom"], "near": [], "separated_from": []}}}}
+            {{"name": "Walk-In Closet", "type": "walk_in_closet", "area_sqm": 4.5, "floor": 1, "has_natural_light": false, "privacy_level": "private", "preferred_width_m": 1.52, "preferred_depth_m": 1.83, "max_width_m": 2.44, "adjacency": {{"connected_to": ["primary_bedroom"], "near": [], "separated_from": []}}}},
+            {{"name": "Primary Bath", "type": "primary_bath", "area_sqm": 5.0, "floor": 1, "has_natural_light": false, "privacy_level": "private", "preferred_width_m": 1.83, "preferred_depth_m": 2.44, "max_width_m": 2.74, "adjacency": {{"connected_to": ["primary_bedroom"], "near": [], "separated_from": []}}}}
           ]
         }},
         {{
