@@ -319,11 +319,19 @@ namespace zHeight.Plugin.Engine
                             }
                         }
 
-                        // Draw deduped wall segments — split at door and window openings
+                        // Draw deduped wall segments — exterior on A-WALL-EXTR (230mm), interior on A-WALL-INTR (150mm)
                         var allWallGaps = doorGaps.Concat(winGaps).ToList();
+                        double extMinX = layout.BuildingX;
+                        double extMaxX = layout.BuildingX + layout.BuildingW;
+                        double extMinY = layout.BuildingY;
+                        double extMaxY = layout.BuildingY + layout.BuildingD;
+                        const double wallExtTol = 100; // mm tolerance for exterior classification
                         foreach (var (x1, y1, x2, y2) in wallSegs)
                         {
-                            try { DrawWallSegmentWithGaps(x1, y1, x2, y2, "A-WALL-INTR",
+                            string wLayer = IsExteriorWall(x1, y1, x2, y2,
+                                                extMinX, extMaxX, extMinY, extMaxY, wallExtTol)
+                                ? "A-WALL-EXTR" : "A-WALL-INTR";
+                            try { DrawWallSegmentWithGaps(x1, y1, x2, y2, wLayer,
                                       floorOffset, space, tr, allWallGaps); }
                             catch { /* wall seg failure is non-fatal */ }
                         }
@@ -562,6 +570,18 @@ namespace zHeight.Plugin.Engine
                 segs.Add((x1, y1, x2, y2));
         }
 
+        // 3.4 — classify a wall segment as exterior (on building bounding box) or interior
+        private static bool IsExteriorWall(
+            double x1, double y1, double x2, double y2,
+            double minX, double maxX, double minY, double maxY, double tol)
+        {
+            bool isHoriz = Math.Abs(y2 - y1) < tol;
+            if (isHoriz)
+                return Math.Abs(y1 - minY) < tol || Math.Abs(y1 - maxY) < tol;
+            else
+                return Math.Abs(x1 - minX) < tol || Math.Abs(x1 - maxX) < tol;
+        }
+
         // MISSING-01: canonical wall key (same rounding as AddWallSeg)
         private static string WallKey(double x1, double y1, double x2, double y2)
         {
@@ -673,30 +693,46 @@ namespace zHeight.Plugin.Engine
             }
         }
 
+        // 3.1 — room-type window profile: (wall fraction, max width mm, high-sill flag, two-window flag)
+        private static (double frac, double maxMm, bool highSill, bool twoWin)
+            GetWindowProfile(string rawType)
+        {
+            string t = (rawType ?? "").ToLowerInvariant().Replace('-', '_').Replace(' ', '_');
+            return t switch {
+                "living_room" or "living" or "great_room" or "family_room" or "open_living"
+                                                                => (0.65, 3600, false, false),
+                "dining_room" or "dining" or "breakfast_nook"   => (0.50, 2400, false, false),
+                "kitchen"     or "open_kitchen"                 => (0.35, 1800, false, true),
+                "primary_bedroom" or "primary_suite" or "master_bedroom"
+                                                                => (0.45, 1800, false, false),
+                "secondary_bedroom" or "bedroom" or "guest_bedroom" or "guest_room"
+                 or "home_office_bedroom" or "nursery"          => (0.40, 1500, false, false),
+                "bathroom" or "primary_bath" or "ensuite_bath" or "ensuite"
+                 or "master_bath" or "secondary_bath" or "shared_bath" or "full_bath"
+                                                                => (0.25,  600,  true, false),
+                "entry" or "foyer" or "entry_foyer" or "vestibule"
+                                                                => (0.35, 1500, false, false),
+                _                                               => (0.45, 1800, false, false),
+            };
+        }
+
         // Window opening gap — same coordinate system as CalcDoorGap (all mm).
         // MISSING-03: uses SolarWall when set, otherwise falls back to Facing.
         private static (bool horiz, double wallCoord, double gapStart, double gapEnd)?
             CalcWindowGap(SpaceNode room)
         {
-            double cx_mm = room.X + room.WidthMm / 2;
-            double cy_mm = room.Y + room.DepthMm / 2;
-            // Solar wall takes priority over spatial facing for window placement
             string wall = string.IsNullOrEmpty(room.SolarWall) ? room.Facing : room.SolarWall;
-            double winW;
+            var (frac, maxMm, _, _) = GetWindowProfile(room.Type);
+            bool   horiz   = wall is "south" or "north";
+            double wallDim = horiz ? room.WidthMm : room.DepthMm;
+            double winW    = Math.Clamp(wallDim * frac, 300, maxMm);
+            double center  = horiz ? room.X + room.WidthMm / 2 : room.Y + room.DepthMm / 2;
             switch (wall)
             {
-                case "north":
-                    winW = Math.Min(room.WidthMm * 0.5, 1800);
-                    return (true, room.Top,   cx_mm - winW / 2, cx_mm + winW / 2);
-                case "east":
-                    winW = Math.Min(room.DepthMm * 0.5, 1800);
-                    return (false, room.Right, cy_mm - winW / 2, cy_mm + winW / 2);
-                case "west":
-                    winW = Math.Min(room.DepthMm * 0.5, 1800);
-                    return (false, room.X,     cy_mm - winW / 2, cy_mm + winW / 2);
-                default: // south
-                    winW = Math.Min(room.WidthMm * 0.5, 1800);
-                    return (true, room.Y,     cx_mm - winW / 2, cx_mm + winW / 2);
+                case "north": return (true,  room.Top,   center - winW / 2, center + winW / 2);
+                case "east":  return (false, room.Right, center - winW / 2, center + winW / 2);
+                case "west":  return (false, room.X,     center - winW / 2, center + winW / 2);
+                default:      return (true,  room.Y,     center - winW / 2, center + winW / 2);
             }
         }
 
@@ -751,6 +787,35 @@ namespace zHeight.Plugin.Engine
             }
         }
 
+        // 3.2 — return arc (startAngle, endAngle) that minimises obstruction for the room type.
+        // Arc sweeps CCW in AutoCAD: 0=east, PI/2=north, PI=west, 3PI/2=south.
+        private static (double start, double end) DoorSwingRule(string rawType, string facing)
+        {
+            string t = (rawType ?? "").ToLowerInvariant().Replace('-', '_').Replace(' ', '_');
+            bool isBath  = t is "bathroom" or "primary_bath" or "ensuite_bath" or "ensuite"
+                        or "master_bath" or "secondary_bath" or "shared_bath" or "full_bath"
+                        or "powder_room" or "half_bath";
+            bool isEntry = t is "entry" or "foyer" or "entry_foyer" or "vestibule";
+            switch (facing)
+            {
+                case "south":
+                    if (isEntry) return (Math.PI / 2, Math.PI);         // entry: hinge right, opens left (N-American)
+                    if (isBath)  return (Math.PI, 3 * Math.PI / 2);     // bath: swings away from vanity
+                    return (0, Math.PI / 2);                            // default: swings right into room
+                case "north":
+                    if (isBath)  return (0, Math.PI / 2);               // bath: swings away from fixtures
+                    return (Math.PI, 3 * Math.PI / 2);                  // default: swings left into room
+                case "east":
+                    if (isBath)  return (Math.PI, 3 * Math.PI / 2);     // bath: swings downward
+                    return (Math.PI / 2, Math.PI);                      // default: swings upward into room
+                case "west":
+                    if (isBath)  return (3 * Math.PI / 2, 2 * Math.PI); // bath: swings downward
+                    return (0, Math.PI / 2);                            // default: swings upward into room
+                default:
+                    return (0, Math.PI / 2);
+            }
+        }
+
         // Fix #9: all door geometry calculated in mm, scaled ONCE at Point3d
         private void DrawDoorOnRoom(SpaceNode room, Point3d offset,
                                      BlockTableRecord space, Transaction tr)
@@ -783,25 +848,26 @@ namespace zHeight.Plugin.Engine
             var    pos      = new Point3d(px_mm * _s + offset.X, py_mm * _s + offset.Y, 0);
             double doorW_du = doorW_mm * _s;
 
-            // Door leaf and arc direction based on wall facing
+            // Door leaf and arc — swing direction from DoorSwingRule (architectural convention)
+            var (swingStart, swingEnd) = DoorSwingRule(room.Type, room.Facing);
             Line leaf; Arc arc;
             switch (room.Facing)
             {
                 case "north":
                     leaf = new Line(pos, new Point3d(pos.X + doorW_du, pos.Y, 0));
-                    arc  = new Arc(pos, doorW_du, 0, -Math.PI / 2);
+                    arc  = new Arc(pos, doorW_du, swingStart, swingEnd);
                     break;
                 case "east":
                     leaf = new Line(pos, new Point3d(pos.X, pos.Y + doorW_du, 0));
-                    arc  = new Arc(pos, doorW_du, Math.PI / 2, Math.PI);
+                    arc  = new Arc(pos, doorW_du, swingStart, swingEnd);
                     break;
                 case "west":
                     leaf = new Line(pos, new Point3d(pos.X, pos.Y + doorW_du, 0));
-                    arc  = new Arc(pos, doorW_du, 0, Math.PI / 2);
+                    arc  = new Arc(pos, doorW_du, swingStart, swingEnd);
                     break;
                 default: // south
                     leaf = new Line(pos, new Point3d(pos.X + doorW_du, pos.Y, 0));
-                    arc  = new Arc(pos, doorW_du, 0, Math.PI / 2);
+                    arc  = new Arc(pos, doorW_du, swingStart, swingEnd);
                     break;
             }
             leaf.Layer = "A-DOOR";
@@ -812,45 +878,54 @@ namespace zHeight.Plugin.Engine
             tr.AddNewlyCreatedDBObject(arc, true);
         }
 
+        // 3.1 — type-aware window placement: correct proportions per room, kitchen gets two windows
         private void DrawWindowOnRoom(SpaceNode room, Point3d offset,
                                        BlockTableRecord space, Transaction tr)
         {
-            // MISSING-03: use SolarWall when set (solar-aware placement) else Facing
-            string wall    = string.IsNullOrEmpty(room.SolarWall) ? room.Facing : room.SolarWall;
-            double winW_mm = Math.Min(Math.Max(room.WidthMm, room.DepthMm) * 0.5, 1800);
-            double cx_mm   = room.X + room.WidthMm / 2;
-            double cy_mm   = room.Y + room.DepthMm / 2;
+            string wall  = string.IsNullOrEmpty(room.SolarWall) ? room.Facing : room.SolarWall;
+            var (frac, maxMm, _, twoWin) = GetWindowProfile(room.Type);
             bool   horiz   = wall is "south" or "north";
+            double wallDim = horiz ? room.WidthMm : room.DepthMm;
+            double winW_mm = Math.Clamp(wallDim * frac, 300, maxMm);
+            double center  = horiz ? room.X + room.WidthMm / 2 : room.Y + room.DepthMm / 2;
 
-            double wx_mm, wy_mm;
-            switch (wall)
+            if (twoWin)
             {
-                case "north": wx_mm = cx_mm - winW_mm / 2; wy_mm = room.Top;   break;
-                case "east":  winW_mm = Math.Min(room.DepthMm * 0.5, 1800);
-                              wx_mm = room.Right;           wy_mm = cy_mm - winW_mm / 2; break;
-                case "west":  winW_mm = Math.Min(room.DepthMm * 0.5, 1800);
-                              wx_mm = room.X;               wy_mm = cy_mm - winW_mm / 2; break;
-                default:      wx_mm = cx_mm - winW_mm / 2; wy_mm = room.Y;     break; // south
+                // Kitchen: two windows flanking the sink zone (centre gap = 10% of wall)
+                double hw   = winW_mm * 0.45;
+                double half = wallDim * 0.05; // half the centre gap
+                DrawWindowGlyph(wall, room, center - half - hw, hw * 2, offset, space, tr);
+                DrawWindowGlyph(wall, room, center + half,      hw * 2, offset, space, tr);
             }
+            else
+            {
+                DrawWindowGlyph(wall, room, center - winW_mm / 2, winW_mm, offset, space, tr);
+            }
+        }
 
+        // Draws the 3-line window glyph on the specified wall.
+        // alongStart = start position along the wall's variable axis (X for horiz, Y for vert).
+        private void DrawWindowGlyph(string wall, SpaceNode room,
+            double alongStart, double winW_mm,
+            Point3d offset, BlockTableRecord space, Transaction tr)
+        {
+            bool   horiz     = wall is "south" or "north";
+            double wallCoord = wall switch {
+                "north" => room.Top,   "east" => room.Right,
+                "west"  => room.X,     _      => room.Y,
+            };
             for (int i = 0; i < 3; i++)
             {
                 double off_du = i * 50 * _s;
                 Line line;
                 if (horiz)
-                {
-                    // Horizontal wall — lines run along X axis
                     line = new Line(
-                        new Point3d(wx_mm * _s + offset.X,              wy_mm * _s + offset.Y + off_du, 0),
-                        new Point3d((wx_mm + winW_mm) * _s + offset.X,  wy_mm * _s + offset.Y + off_du, 0));
-                }
+                        new Point3d(alongStart            * _s + offset.X, wallCoord * _s + offset.Y + off_du, 0),
+                        new Point3d((alongStart + winW_mm) * _s + offset.X, wallCoord * _s + offset.Y + off_du, 0));
                 else
-                {
-                    // Vertical wall (east/west) — lines run along Y axis
                     line = new Line(
-                        new Point3d(wx_mm * _s + offset.X + off_du, wy_mm * _s + offset.Y,              0),
-                        new Point3d(wx_mm * _s + offset.X + off_du, (wy_mm + winW_mm) * _s + offset.Y,  0));
-                }
+                        new Point3d(wallCoord * _s + offset.X + off_du, alongStart            * _s + offset.Y, 0),
+                        new Point3d(wallCoord * _s + offset.X + off_du, (alongStart + winW_mm) * _s + offset.Y, 0));
                 line.Layer = "A-GLAZ";
                 space.AppendEntity(line);
                 tr.AddNewlyCreatedDBObject(line, true);
@@ -1004,8 +1079,8 @@ namespace zHeight.Plugin.Engine
             DrawFurnCircle(sinkX + 200, room.Y + clearance + counterD * 0.5,
                            150, offset, space, tr);
 
-            // Island: only if room is at least 3600 wide and 3000 deep
-            if (room.WidthMm >= 3600 && room.DepthMm >= 3000)
+            // Island: room > 10 sqm with 1200mm clearance on all sides (work triangle rule)
+            if (room.AreaSqm >= 10.0 && room.WidthMm >= 2700 && room.DepthMm >= 2700)
             {
                 double islandW = Math.Min(1500.0, room.WidthMm - 2 * (counterD + 900));
                 double islandD = 900.0;
@@ -1018,27 +1093,53 @@ namespace zHeight.Plugin.Engine
             }
         }
 
-        // Bed (king or queen) + 2 side tables, centred against the north wall
+        // Bed (king or queen) + 2 side tables — placed against the wall OPPOSITE the door (Facing wall).
+        // This matches the architectural convention: door opens into the room, bed faces it.
         private void DrawBedFurniture(SpaceNode room, Point3d offset,
             BlockTableRecord space, Transaction tr, bool king)
         {
             double bedW = king ? 1930.0 : 1524.0;
             double bedD = king ? 2030.0 : 2032.0;
-            const double stW = 600.0, stD = 450.0; // side table
+            const double stW = 600.0, stD = 450.0;
             const double clearance = 200.0;
 
             if (room.WidthMm < bedW + 2 * clearance || room.DepthMm < bedD + 600) return;
 
-            // Bed centred horizontally, placed near the north wall (top)
-            double bedX = room.X + (room.WidthMm - bedW) / 2;
-            double bedY = room.Top - clearance - bedD;
+            double bedX, bedY;
+            switch (room.Facing)
+            {
+                case "north": // door on north → bed against south wall
+                    bedX = room.X + (room.WidthMm - bedW) / 2;
+                    bedY = room.Y + clearance;
+                    break;
+                case "east": // door on east → bed head against west wall, centred N-S
+                    bedX = room.X + clearance;
+                    bedY = room.Y + (room.DepthMm - bedD) / 2;
+                    break;
+                case "west": // door on west → bed head against east wall, centred N-S
+                    bedX = room.Right - clearance - bedW;
+                    bedY = room.Y + (room.DepthMm - bedD) / 2;
+                    break;
+                default: // south (most common): door on south → bed against north wall
+                    bedX = room.X + (room.WidthMm - bedW) / 2;
+                    bedY = room.Top - clearance - bedD;
+                    break;
+            }
             DrawFurnRect(bedX, bedY, bedW, bedD, offset, space, tr);
 
-            // Side tables flanking the bed (only if space allows)
-            if (bedX - room.X > stW + clearance)
+            // Side tables flanking the bed's long sides
+            bool bedRunsEW = room.Facing is "east" or "west";
+            if (bedRunsEW)
             {
-                DrawFurnRect(bedX - stW - 100, bedY + bedD - stD, stW, stD, offset, space, tr);
-                DrawFurnRect(bedX + bedW + 100, bedY + bedD - stD, stW, stD, offset, space, tr);
+                // Bed is against E or W wall — side tables above and below (in Y)
+                DrawFurnRect(bedX + (bedW - stW) / 2, bedY - stD - 100,    stW, stD, offset, space, tr);
+                DrawFurnRect(bedX + (bedW - stW) / 2, bedY + bedD + 100,   stW, stD, offset, space, tr);
+            }
+            else if (bedX - room.X > stW + clearance)
+            {
+                // Bed is against N or S wall — side tables left and right (in X)
+                DrawFurnRect(bedX - stW - 100,  bedY + (bedD - stD) / 2, stW, stD, offset, space, tr);
+                DrawFurnRect(bedX + bedW + 100, bedY + (bedD - stD) / 2, stW, stD, offset, space, tr);
             }
         }
 

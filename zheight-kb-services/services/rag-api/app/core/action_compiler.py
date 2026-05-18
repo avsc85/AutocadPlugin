@@ -62,39 +62,86 @@ def _infer_zone_pos(room_type: str) -> str:
     return _TYPE_TO_ZONE.get(t, "centre")
 
 
-# FIX-ARCH-04: half-bath types are public-zone guest facilities — never in bedroom wing
-_HALF_BATH_TYPES = {"powder_room", "half_bath", "toilet"}
+# FIX-ARCH-04 / FIX-ARCH-05: canonical type → zone correctness rules
+_HALF_BATH_TYPES    = {"powder_room", "half_bath", "toilet"}
+_LAUNDRY_TYPES      = {"laundry", "laundry_room"}
+_PANTRY_TYPES       = {"pantry"}
+_MUDROOM_TYPES      = {"mudroom", "mud_room"}
+_GARAGE_TYPES       = {"garage", "carport", "parking"}
+
+# Types that must always land in a specific zone regardless of what Gemini said.
+# Rule format: (from_positions: set|None, to_position: str, condition: callable|None)
+#   from_positions=None  → apply from ANY zone
+#   condition(space, zones) → extra guard; True means "migrate this space"
+_ZONE_RULES: list[tuple[set | None, str, object]] = [
+    # half-baths always belong in front (public zone) — never in bedroom wing
+    (_HALF_BATH_TYPES, None, "front", None),
+    # laundry in the centre (open-plan) zone is wrong — belongs in service
+    (_LAUNDRY_TYPES,   {"centre"}, "service", None),
+    # pantry in the front (entry/foyer) zone is wrong — belongs in service
+    (_PANTRY_TYPES,    {"front"},  "service", None),
+    # mudroom in rear without a nearby garage → service (utility/entry corridor)
+    (_MUDROOM_TYPES,   {"rear"},   "service",
+     lambda _s, zs: not any(
+         (sp.get("type") or "").lower().replace("-", "_").replace(" ", "_")
+         in _GARAGE_TYPES
+         for z in zs for sp in (z.get("spaces") or [])
+     )),
+]
 
 
-def _reclassify_halfbaths_to_front(zones: list) -> list:
-    """Move any half-bath rooms from non-front zones into the front zone.
+def _enforce_zone_classifications(zones: list) -> list:
+    """Run a full type→zone correction pass, fixing Gemini misclassifications.
 
-    Gemini occasionally places powder_room in zone 'rear'. This corrects that
-    before the C# solver sees the data, ensuring entry-row placement.
+    Rules applied (in order):
+      1. half-bath (powder_room/half_bath/toilet) in any non-front zone → front
+      2. laundry in centre zone → service
+      3. pantry in front zone → service
+      4. mudroom in rear zone with no garage anywhere in plan → service
     """
-    migrated: list[dict] = []
-    for zone in zones:
-        if zone.get("zone_position") == "front":
-            continue
-        remaining = []
-        for s in zone.get("spaces") or []:
-            t = (s.get("type") or "").lower().replace("-", "_").replace(" ", "_")
-            if t in _HALF_BATH_TYPES:
-                migrated.append(s)
-            else:
-                remaining.append(s)
-        zone["spaces"] = remaining
+    def _norm(t: str) -> str:
+        return (t or "").lower().replace("-", "_").replace(" ", "_")
 
-    if not migrated:
+    # Collect migrations: list of (space_dict, target_zone_position)
+    migrations: list[tuple[dict, str]] = []
+
+    for rule_types, rule_from_positions, rule_to, rule_cond in _ZONE_RULES:
+        for zone in zones:
+            zpos = zone.get("zone_position", "")
+            # Skip if rule_from_positions restricts source zone and this doesn't match
+            if rule_from_positions is not None and zpos not in rule_from_positions:
+                continue
+            # Skip if already in the target zone
+            if zpos == rule_to:
+                continue
+
+            remaining = []
+            for s in (zone.get("spaces") or []):
+                t = _norm(s.get("type", ""))
+                if t in rule_types:
+                    if rule_cond is None or rule_cond(s, zones):
+                        migrations.append((s, rule_to))
+                        continue
+                remaining.append(s)
+            zone["spaces"] = remaining
+
+    if not migrations:
         return [z for z in zones if z.get("spaces")]
 
-    front = next((z for z in zones if z.get("zone_position") == "front"), None)
-    if front is None:
-        front = {"zone_name": "front", "zone_position": "front", "spaces": []}
-        zones = list(zones) + [front]
-    front.setdefault("spaces", []).extend(migrated)
+    # Ensure target zones exist and deposit migrated spaces
+    zone_by_pos: dict[str, dict] = {z.get("zone_position", ""): z for z in zones}
+    zones_list = list(zones)
+    for space, target_pos in migrations:
+        if target_pos not in zone_by_pos:
+            new_zone = {"zone_name": target_pos, "zone_position": target_pos, "spaces": []}
+            zones_list.append(new_zone)
+            zone_by_pos[target_pos] = new_zone
+        zone_by_pos[target_pos].setdefault("spaces", []).append(space)
+        log.debug("zone_classification_corrected",
+                  space=space.get("name"), type=space.get("type"),
+                  to=target_pos)
 
-    return [z for z in zones if z.get("spaces")]
+    return [z for z in zones_list if z.get("spaces")]
 
 
 def _normalize_to_zones(variation: dict) -> list | None:
@@ -111,7 +158,7 @@ def _normalize_to_zones(variation: dict) -> list | None:
                           if isinstance(z, dict))
         log.debug("zones_schema_detected", source="zones",
                   zone_count=len(raw_zones), space_count=total_spaces)
-        return _reclassify_halfbaths_to_front(raw_zones)
+        return _enforce_zone_classifications(raw_zones)
 
     # 2. Flat space lists under alternate keys
     flat: list | None = None
@@ -153,7 +200,7 @@ def _normalize_to_zones(variation: dict) -> list | None:
     )
     log.info("zones_normalization_complete", zone_count=len(zones),
              total_spaces=len(flat), adjacency_entries=total_adj)
-    return _reclassify_halfbaths_to_front(zones)
+    return _enforce_zone_classifications(zones)
 
 
 AIA_LAYERS = {

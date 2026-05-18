@@ -129,6 +129,15 @@ YOU MUST PRODUCE 10 DIMENSIONS OF ARCHITECTURAL INTELLIGENCE:
     "living_right" → living faces front-right (narrow east-facing lots)
     In BOTH cases: bedrooms must be farthest from street entry (rear of lot in Y axis).
 
+11. KITCHEN WORK TRIANGLE:
+    - Refrigerator, sink, and cooktop must each be within 2.1m–2.7m of each other.
+    - Kitchen minimum internal width: 2700mm (even if area is small).
+    - Island kitchens require 1200mm circulation clearance on all four sides.
+    - If kitchen area_sqm < 7.5 → "kitchen_type": "galley" (single-wall, max 2.4m wide).
+    - If kitchen area_sqm 7.5–12 → "kitchen_type": "L_shape" (preferred_width_m ≥ 2.7).
+    - If kitchen area_sqm > 12 → "kitchen_type": "island" or "U_shape".
+    - Add "kitchen_type" field to EVERY kitchen space object in every variation.
+
 PRIMARY SUITE STRATEGY (mandatory):
 - primary_bedroom placed at REAR of bedroom wing (highest Y — farthest from street)
 - Suite cluster = primary_bedroom + primary_bath + walk_in_closet (all in zone "rear")
@@ -222,6 +231,18 @@ REQUIRED SPACE METADATA — every space object inside zones must include:
   "natural_light": true | false
   "privacy_level": "public" | "semi_private" | "private" | "service"
   "adjacency": ["type_or_zone_name", ...]
+  "preferred_width_m": preferred minimum width in metres (architecturally correct; NOT code minimum)
+  "preferred_depth_m": preferred minimum depth in metres (architecturally correct)
+  "max_width_m": maximum acceptable width before room feels oversized or disproportionate
+  — These three dimension fields are MANDATORY on every space. The geometry engine uses them
+    to enforce room proportions during placement. Use the standard US residential values:
+    primary_bedroom → preferred_width_m: 3.66, preferred_depth_m: 4.12, max_width_m: 6.0
+    secondary_bedroom → preferred_width_m: 3.05, preferred_depth_m: 3.66, max_width_m: 5.0
+    kitchen (L_shape) → preferred_width_m: 2.7, preferred_depth_m: 3.6, max_width_m: 5.5
+    living_room → preferred_width_m: 4.2, preferred_depth_m: 5.5, max_width_m: 9.0
+    dining → preferred_width_m: 3.0, preferred_depth_m: 3.6, max_width_m: 6.0
+    primary_bath → preferred_width_m: 1.83, preferred_depth_m: 2.44, max_width_m: 3.5
+    bathroom → preferred_width_m: 1.52, preferred_depth_m: 2.44, max_width_m: 2.8
 
 ADJACENCY RULES — enforce in every variation:
 - kitchen must list dining or living in its adjacency
@@ -479,9 +500,9 @@ Generate exactly 3 layout variations. Output this JSON structure exactly:
           "zone_name": "centre",
           "zone_position": "centre",
           "spaces": [
-            {{"name": "Kitchen", "type": "kitchen", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "public", "adjacency": {{"connected_to": ["dining", "living"], "near": ["laundry"], "separated_from": []}}}},
-            {{"name": "Dining Room", "type": "dining", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "public", "adjacency": {{"connected_to": ["kitchen", "living"], "near": [], "separated_from": []}}}},
-            {{"name": "Family Room", "type": "living", "area_sqm": 23.0, "floor": 1, "has_natural_light": true, "privacy_level": "public", "adjacency": {{"connected_to": ["kitchen", "dining", "entry"], "near": [], "separated_from": []}}}}
+            {{"name": "Kitchen", "type": "kitchen", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "public", "kitchen_type": "L_shape", "preferred_width_m": 2.7, "preferred_depth_m": 3.6, "max_width_m": 5.5, "adjacency": {{"connected_to": ["dining", "living"], "near": ["laundry"], "separated_from": []}}}},
+            {{"name": "Dining Room", "type": "dining", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "public", "preferred_width_m": 3.0, "preferred_depth_m": 3.6, "max_width_m": 6.0, "adjacency": {{"connected_to": ["kitchen", "living"], "near": [], "separated_from": []}}}},
+            {{"name": "Family Room", "type": "living", "area_sqm": 23.0, "floor": 1, "has_natural_light": true, "privacy_level": "public", "preferred_width_m": 4.2, "preferred_depth_m": 5.5, "max_width_m": 9.0, "adjacency": {{"connected_to": ["kitchen", "dining", "entry"], "near": [], "separated_from": []}}}}
           ]
         }},
         {{
@@ -491,7 +512,7 @@ Generate exactly 3 layout variations. Output this JSON structure exactly:
             {{"name": "Bedroom 2", "type": "secondary_bedroom", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "private", "adjacency": {{"connected_to": ["bathroom"], "near": ["hallway"], "separated_from": ["garage", "entry"]}}}},
             {{"name": "Bedroom 3", "type": "secondary_bedroom", "area_sqm": 11.0, "floor": 1, "has_natural_light": true, "privacy_level": "private", "adjacency": {{"connected_to": ["bathroom"], "near": ["hallway"], "separated_from": ["garage", "entry"]}}}},
             {{"name": "Bath 2", "type": "bathroom", "area_sqm": 3.7, "floor": 1, "has_natural_light": false, "privacy_level": "private", "adjacency": {{"connected_to": ["secondary_bedroom"], "near": [], "separated_from": []}}}},
-            {{"name": "Primary Suite", "type": "primary_bedroom", "area_sqm": 18.0, "floor": 1, "has_natural_light": true, "privacy_level": "private", "adjacency": {{"connected_to": ["primary_bath", "walk_in_closet"], "near": [], "separated_from": ["garage", "entry", "great_room", "foyer"]}}}},
+            {{"name": "Primary Suite", "type": "primary_bedroom", "area_sqm": 18.0, "floor": 1, "has_natural_light": true, "privacy_level": "private", "preferred_width_m": 3.66, "preferred_depth_m": 4.12, "max_width_m": 6.0, "adjacency": {{"connected_to": ["primary_bath", "walk_in_closet"], "near": [], "separated_from": ["garage", "entry", "great_room", "foyer"]}}}},
             {{"name": "Walk-In Closet", "type": "walk_in_closet", "area_sqm": 4.5, "floor": 1, "has_natural_light": false, "privacy_level": "private", "adjacency": {{"connected_to": ["primary_bedroom"], "near": [], "separated_from": []}}}},
             {{"name": "Primary Bath", "type": "primary_bath", "area_sqm": 4.5, "floor": 1, "has_natural_light": false, "privacy_level": "private", "adjacency": {{"connected_to": ["primary_bedroom"], "near": [], "separated_from": []}}}}
           ]
@@ -522,8 +543,9 @@ INSTRUCTIONS:
    enclair, sunroom, covered_porch, laundry, mudroom, garage, pantry.
 4. Kitchen + dining + living MUST be in ONE zone with zone_position "centre".
 5. Do NOT add hallway, corridor, backyard, yard, garden, or any outdoor space.
-6. Variation 2: use organisation_type "split_wing", organisation_strategy "open_plan" —
-   larger open living, consider "living_right" wing_orientation if solar context suits it.
+6. Variation 2: use organisation_type "split_wing", organisation_strategy "split_wing" —
+   Y-shaped plan: open living core at front (full stem width), bedroom wing and service wing
+   diverging at rear. Consider "living_right" wing_orientation if solar context suits it.
 7. Variation 3: use organisation_type "compact_urban", organisation_strategy "spine" —
    tight footprint, efficiency-first, compact bedroom wing.
 8. Each variation should adjust room count and sizes to reflect the brief.
@@ -539,7 +561,11 @@ INSTRUCTIONS:
 12. In zone "rear": secondary bedrooms FIRST (near street / low Y), primary suite LAST
     (deepest into lot — rear privacy corner). The layout engine places them in list order.
 13. Use the precedent patterns above to justify organisation_type and wing_orientation
-    choices — adapt spatial intelligence to this brief, do not copy areas or layouts."""
+    choices — adapt spatial intelligence to this brief, do not copy areas or layouts.
+14. Every space MUST include "preferred_width_m", "preferred_depth_m", and "max_width_m"
+    (float metres). Kitchen spaces MUST also include "kitchen_type" ("galley", "L_shape",
+    "island", or "U_shape") per constraint 11. Omitting these fields will break the
+    geometry engine's proportion enforcement."""
 
     # ── 4. Generate ───────────────────────────────────────────────────────────
     generation: dict = {}

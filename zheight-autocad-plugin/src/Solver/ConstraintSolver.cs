@@ -2,13 +2,16 @@
 // Validates and repairs geometry from the AI before drawing.
 // Runs deterministically in C# — no AI involved.
 //
-// Six constraint checks:
-//   1. No-overlap (AABB)
-//   2. Site boundary (plot minus setbacks)
-//   3. FAR / coverage
-//   4. Adjacency requirements
-//   5. Circulation (every room reachable via BFS from entry)
-//   6. Minimum dimensions by space type
+// Nine constraint checks:
+//   1. Baseline minimum dimensions (1800mm) — repair by scaling up
+//   2. No-overlap (AABB) — repair with displacement
+//   3. Site boundary (plot minus setbacks)
+//   4. FAR / coverage
+//   5. Adjacency requirements
+//   6. Circulation (every room reachable via BFS from entry)
+//   7. IRC 2021 code minimums by room type (habitable 2134mm, bath 1524mm, corridor 915mm)
+//   8. Kitchen work triangle (2700mm × 2700mm minimum)
+//   9. Bathroom-to-bedroom ratio and one-hop proximity
 
 using System;
 using System.Collections.Generic;
@@ -111,6 +114,9 @@ namespace zHeight.Plugin.Solver
                     r.Height = Math.Max(r.Height, MinRoomDimMm);
                 }
             }
+
+            // ── 7+8. IRC 2021 code minimums + kitchen work triangle (after baseline repair) ──
+            ValidateMinimumDimensions(rooms, result);
 
             // ── 2. No-overlap — repair with displacement ──────────────────────
             int passes = 0;
@@ -227,6 +233,9 @@ namespace zHeight.Plugin.Solver
             // VALIDATION-FIX: CHECK-CS03 — required type-based adjacency pairs
             CheckRequiredAdjacency(rooms, result);
 
+            // ── 9. Bathroom-to-bedroom ratio and one-hop proximity ────────────
+            ValidateBathroomBedRatio(rooms, result);
+
             // VALIDATION-FIX: CHECK-MISSING-10 — stair alignment across floors
             ValidateStairAlignment(rooms, result);
 
@@ -299,6 +308,114 @@ namespace zHeight.Plugin.Solver
                     result.Warnings.Add(
                         $"Stair '{s1.Name}' (floor 1) does not align with any floor-2 stair — structural issue");
             }
+        }
+
+        // ── IRC 2021 + Kitchen Work Triangle ─────────────────────────────────
+
+        // 4.1 — IRC 2021 §R304/R307/R311 minimum dimensions per room type.
+        // 4.2 — Kitchen work triangle: 2700mm × 2700mm minimum rectangle.
+        private static void ValidateMinimumDimensions(List<RoomRect> rooms, SolverResult result)
+        {
+            const double habitableMin = 2134; // §R304.2 — 7 ft any horizontal direction
+            const double bathMin      = 1524; // §R307.1 — 5 ft for bathroom with tub/shower
+            const double hallMin      =  915; // §R311.6 — 3 ft clear corridor width
+            const double kitchenMin   = 2700; // work triangle: all sides ≤ 2.7m
+
+            foreach (var r in rooms)
+            {
+                string t = RoomT(r.Type);
+                bool isHabitable = t is "bedroom" or "primary_bedroom" or "primary_suite"
+                    or "master_bedroom" or "secondary_bedroom" or "guest_bedroom"
+                    or "guest_room" or "home_office_bedroom" or "nursery"
+                    or "living_room" or "living" or "great_room" or "family_room"
+                    or "open_living" or "dining_room" or "dining";
+                bool isBath    = IsFullBathType(t);
+                bool isHall    = t is "corridor" or "hallway";
+                bool isKitchen = t is "kitchen" or "open_kitchen";
+
+                if (isHabitable)
+                {
+                    double shortest = Math.Min(r.Width, r.Height);
+                    if (shortest < habitableMin)
+                        result.Errors.Add(
+                            $"IRC 2021 §R304.2 — {r.Name}: shortest dimension " +
+                            $"{shortest:F0}mm < 2134mm (7 ft) required for habitable room");
+                }
+                if (isBath && (r.Width < bathMin || r.Height < bathMin))
+                    result.Warnings.Add(
+                        $"IRC 2021 §R307.1 — {r.Name}: {r.Width:F0}×{r.Height:F0}mm " +
+                        $"< 1524mm (5 ft) minimum for bathroom");
+                if (isHall)
+                {
+                    double hallW = Math.Min(r.Width, r.Height);
+                    if (hallW < hallMin)
+                        result.Warnings.Add(
+                            $"IRC 2021 §R311.6 — {r.Name}: corridor width {hallW:F0}mm " +
+                            $"< 915mm (3 ft) minimum");
+                }
+                if (isKitchen && (r.Width < kitchenMin || r.Height < kitchenMin))
+                    result.Errors.Add(
+                        $"Work triangle — {r.Name}: {r.Width:F0}×{r.Height:F0}mm " +
+                        $"is too small for a valid work triangle (minimum 2700×2700mm)");
+            }
+        }
+
+        // 4.3 — Each bedroom must have a full bathroom within one adjacency hop.
+        // Also checks the bedroom-to-bathroom ratio (warn if > 2 bedrooms per bath).
+        private static void ValidateBathroomBedRatio(List<RoomRect> rooms, SolverResult result)
+        {
+            var beds  = rooms.Where(r => IsBedType(r.Type)).ToList();
+            var baths = rooms.Where(r => IsFullBathType(r.Type)).ToList();
+
+            if (!beds.Any()) return;
+
+            // Ratio warning
+            if (baths.Count > 0 && (double)beds.Count / baths.Count > 2.0)
+                result.Warnings.Add(
+                    $"Bedroom-to-bathroom ratio {beds.Count}:{baths.Count} — " +
+                    $"recommend at least 1 full bath per 2 bedrooms");
+
+            if (!baths.Any())
+            {
+                result.Warnings.Add("No full bathrooms found — every bedroom needs bathroom access");
+                return;
+            }
+
+            // One-hop proximity: bed directly adjacent to bath, OR bed→corridor→bath
+            const double hopTol = 400; // mm — slightly looser than strict adjacency to handle corridor gap
+            foreach (var bed in beds)
+            {
+                bool hasAccess = baths.Any(bath => bed.IsAdjacentTo(bath, hopTol))
+                    || rooms.Any(mid =>
+                        !IsBedType(mid.Type) && !IsFullBathType(mid.Type) &&
+                        bed.IsAdjacentTo(mid, hopTol) &&
+                        baths.Any(bath => mid.IsAdjacentTo(bath, hopTol)));
+
+                if (!hasAccess)
+                    result.Warnings.Add(
+                        $"{bed.Name}: no full bathroom reachable within one door of travel — " +
+                        $"verify suite pairing in layout");
+            }
+        }
+
+        // ── Type helpers ──────────────────────────────────────────────────────
+
+        private static string RoomT(string? raw) =>
+            (raw ?? "").ToLowerInvariant().Replace('-', '_').Replace(' ', '_');
+
+        private static bool IsBedType(string? raw)
+        {
+            string t = RoomT(raw);
+            return t is "bedroom" or "primary_bedroom" or "primary_suite" or "master_bedroom"
+                or "secondary_bedroom" or "guest_bedroom" or "guest_room"
+                or "home_office_bedroom" or "nursery";
+        }
+
+        private static bool IsFullBathType(string? raw)
+        {
+            string t = RoomT(raw);
+            return t is "bathroom" or "primary_bath" or "ensuite_bath" or "ensuite"
+                or "master_bath" or "secondary_bath" or "shared_bath" or "full_bath";
         }
 
         // ── Helpers ───────────────────────────────────────────────────────────

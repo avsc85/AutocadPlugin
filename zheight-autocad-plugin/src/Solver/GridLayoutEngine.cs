@@ -213,7 +213,10 @@ namespace zHeight.Plugin.Solver
                 string.Equals(strategy, "residential", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(strategy, "open_plan",   StringComparison.OrdinalIgnoreCase);
 
-            if (useResidential && !string.Equals(strategy, "spine", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(strategy, "split_wing", StringComparison.OrdinalIgnoreCase))
+                LayoutSplitWing(zones, bx, by, bw, bd, result, warnings,
+                                wingOrientation, garagePlacement);
+            else if (useResidential && !string.Equals(strategy, "spine", StringComparison.OrdinalIgnoreCase))
                 LayoutResidentialWing(zones, bx, by, bw, bd, result, warnings,
                                       strategy, wingOrientation, garagePlacement);
             else if (string.Equals(strategy, "spine", StringComparison.OrdinalIgnoreCase))
@@ -355,6 +358,8 @@ namespace zHeight.Plugin.Solver
                 double rh   = Math.Max(rowH[ri], MIN_DIM);
                 var    bath = i < remBaths.Count ? remBaths[i] : null;
                 double bw2  = bath != null ? Snap(bedWingW * 0.65, GRID) : bedWingW;
+                if (bath != null)
+                    bw2 = ClampAspectRatio(bw2, rh, 0.65, 1.35, MIN_DIM, bedWingW - MIN_DIM);
                 bw2 = Math.Max(bw2, MIN_DIM);
 
                 secBeds[i].Facing    = bedFacing;
@@ -376,7 +381,13 @@ namespace zHeight.Plugin.Solver
                 bool   hasW  = primaryWic != null;
                 bool   hasB  = primaryBath != null;
 
-                double bedFrac = hasW && hasB ? 0.55 : hasB ? 0.65 : 1.0;
+                // Derive suite sub-widths from standard dims so proportions match real rooms
+                double stdBedW  = StandardDims(primaryBed.Type, primaryBed.AreaSqm).w;
+                double stdExtra = (hasW ? StandardDims(primaryWic!.Type,  primaryWic.AreaSqm).w  : 0)
+                                + (hasB ? StandardDims(primaryBath!.Type, primaryBath.AreaSqm).w : 0);
+                double bedFrac  = stdBedW + stdExtra > 0
+                    ? Math.Clamp(stdBedW / (stdBedW + stdExtra), 0.40, 0.75)
+                    : (hasW && hasB ? 0.55 : hasB ? 0.65 : 1.0);
                 double bedW    = Snap(bedWingW * bedFrac, GRID);
                 double rem     = bedWingW - bedW;
 
@@ -419,13 +430,22 @@ namespace zHeight.Plugin.Solver
                 });
             }
 
-            // ── Hallway (full house depth) ────────────────────────────────────
+            // ── Hallway with linen-closet termination (visual corridor stop at rear) ──
+            double linenD   = 900; // 900mm deep linen closet terminates the corridor
+            double hallCorD = houseD - linenD;
             result.Rooms.Add(new SpaceNode
             {
                 Name = "Hallway", Type = "corridor", ZoneName = "circulation",
                 Floor = floor, HasNaturalLight = false, Facing = "south",
-                X = hallX, Y = by, WidthMm = hallW, DepthMm = houseD,
-                AreaSqm = hallW * houseD / 1_000_000.0,
+                X = hallX, Y = by, WidthMm = hallW, DepthMm = hallCorD,
+                AreaSqm = hallW * hallCorD / 1_000_000.0,
+            });
+            result.Rooms.Add(new SpaceNode
+            {
+                Name = "Linen", Type = "storage", ZoneName = "circulation",
+                Floor = floor, HasNaturalLight = false, Facing = "north",
+                X = hallX, Y = by + hallCorD, WidthMm = hallW, DepthMm = linenD,
+                AreaSqm = hallW * linenD / 1_000_000.0,
             });
 
             // ── Living wing height budget ─────────────────────────────────────
@@ -550,22 +570,80 @@ namespace zHeight.Plugin.Solver
             double totalOpenArea = openSeq.Sum(n => n.AreaSqm) < 0.01
                 ? openArea : openSeq.Sum(n => Math.Max(n.AreaSqm, 1.0));
             double curLivY = livY;
-            for (int i = 0; i < openSeq.Count; i++)
+
+            // ── ARCH-04: Lateral open-plan — Living full-width at front (south),
+            //             Dining + Kitchen side-by-side at rear (toward backyard/enclair).
+            //   livWingW
+            //   ├────────────────────────────────┐
+            //   │       LIVING  (full width)      │  ~55 % of openH — faces entry
+            //   ├───────────────┬────────────────┤
+            //   │    DINING     │    KITCHEN     │  ~45 % of openH — kitchen at enclair
+            //   └───────────────┴────────────────┘
+            bool useLateral = lNode != null && (dNode != null || kNode != null);
+            if (useLateral)
             {
-                var node = openSeq[i];
-                double frac   = totalOpenArea > 0 ? node.AreaSqm / totalOpenArea : 1.0 / openSeq.Count;
-                double roomH  = (i == openSeq.Count - 1)
-                    ? livY + openH - curLivY
-                    : Snap(openH * frac, GRID);
-                roomH = Math.Max(roomH, MIN_DIM);
-                node.IsOpenPlan = true;
-                node.ZoneName   = "open_plan";
-                node.Facing     = "north";
-                // MISSING-02: primary axis — living faces entry (south glazing),
-                //             kitchen faces enclair/backyard (north glazing).
-                node.SolarWall  = SolarWallForType(N(node.Type));
-                Place(node, livX, curLivY, livWingW, roomH, result.Rooms);
-                curLivY += roomH;
+                double livFrac = totalOpenArea > 0 && lNode!.AreaSqm > 0
+                    ? lNode.AreaSqm / totalOpenArea : 0.55;
+                livFrac = Math.Clamp(livFrac, 0.45, 0.65);
+                double frontH = Snap(openH * livFrac, GRID);
+                frontH = Math.Max(frontH, STRUCT * 3);
+                double rearH  = openH - frontH;
+                rearH  = Math.Max(rearH, STRUCT * 2);
+                frontH = openH - rearH; // ensure exact sum
+
+                lNode!.IsOpenPlan = true; lNode.ZoneName = "open_plan";
+                lNode.Facing = "south";  lNode.SolarWall = "south";
+                Place(lNode, livX, curLivY, livWingW, frontH, result.Rooms);
+                curLivY += frontH;
+
+                if (dNode != null && kNode != null)
+                {
+                    double dkTotal = Math.Max(dNode.AreaSqm, 1.0) + Math.Max(kNode.AreaSqm, 1.0);
+                    double kitFrac = Math.Clamp(kNode.AreaSqm / dkTotal, 0.40, 0.60);
+                    double kitW    = Snap(livWingW * kitFrac, GRID);
+                    double dinW    = livWingW - kitW;
+                    kitW = Math.Max(kitW, MIN_DIM); dinW = Math.Max(dinW, MIN_DIM);
+
+                    dNode.IsOpenPlan = true; dNode.ZoneName = "open_plan";
+                    dNode.Facing = "north"; dNode.SolarWall = "south";
+                    Place(dNode, livX, curLivY, dinW, rearH, result.Rooms);
+
+                    kNode.IsOpenPlan = true; kNode.ZoneName = "open_plan";
+                    kNode.Facing = "north"; kNode.SolarWall = "north";
+                    Place(kNode, livX + dinW, curLivY, kitW, rearH, result.Rooms);
+                }
+                else if (kNode != null)
+                {
+                    kNode.IsOpenPlan = true; kNode.ZoneName = "open_plan";
+                    kNode.Facing = "north"; kNode.SolarWall = "north";
+                    Place(kNode, livX, curLivY, livWingW, rearH, result.Rooms);
+                }
+                else
+                {
+                    dNode!.IsOpenPlan = true; dNode!.ZoneName = "open_plan";
+                    dNode.Facing = "north"; dNode.SolarWall = "south";
+                    Place(dNode, livX, curLivY, livWingW, rearH, result.Rooms);
+                }
+                curLivY += rearH;
+            }
+            else
+            {
+                // Stacked fallback when only one open-plan zone type exists
+                for (int i = 0; i < openSeq.Count; i++)
+                {
+                    var node = openSeq[i];
+                    double frac  = totalOpenArea > 0 ? node.AreaSqm / totalOpenArea : 1.0 / openSeq.Count;
+                    double roomH = (i == openSeq.Count - 1)
+                        ? livY + openH - curLivY
+                        : Snap(openH * frac, GRID);
+                    roomH = Math.Max(roomH, MIN_DIM);
+                    node.IsOpenPlan = true;
+                    node.ZoneName   = "open_plan";
+                    node.Facing     = "north";
+                    node.SolarWall  = SolarWallForType(N(node.Type));
+                    Place(node, livX, curLivY, livWingW, roomH, result.Rooms);
+                    curLivY += roomH;
+                }
             }
             livY += openH;
 
@@ -623,6 +701,361 @@ namespace zHeight.Plugin.Solver
                         garages[i].HasNaturalLight = true;
                     }
                     Place(garages[i], tmpX, garY, w, rearGarH, result.Rooms);
+                    tmpX += w;
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // SPLIT-WING LAYOUT  (Y / T footprint)
+        // ══════════════════════════════════════════════════════════════════════
+        //   Street
+        //   ├─────────────────────────────────────────────────┐
+        //   │        STEM — open living core (full width)      │  ~45% depth
+        //   │        Entry → Living → Dining + Kitchen         │
+        //   └──────────────────────┬──────────────────────────┘
+        //          [light gap]     │     [light gap]
+        //   ┌──────────────┐  gap  ┌──────────────┐
+        //   │  BED WING    │       │  SERVICE WING │  ~55% depth
+        //   │  Sec beds    │       │  Laundry      │
+        //   │  Primary suite│      │  Mudroom      │
+        //   └──────────────┘       │  Garage/Enclair│
+        //                          └──────────────┘
+        //   Backyard
+        // Wing orientation ("living_left" default):
+        //   bedroom wing on RIGHT (high X), service wing on LEFT (low X)
+        private static void LayoutSplitWing(
+            List<ZoneGroup> zones,
+            double bx, double by, double bw, double bd,
+            LayoutResult result, List<string> warnings,
+            string wingOrientation, string garagePlacement)
+        {
+            var all   = zones.SelectMany(z => z.Spaces).ToList();
+            int floor = all.Select(s => s.Floor).DefaultIfEmpty(1).Min();
+            double sqm = Math.Max(all.Sum(s => Math.Max(s.AreaSqm, 1.0)), 30.0);
+
+            // ── Footprint: wide stem + two diverging wings ────────────────────
+            double mm2    = sqm * 1_000_000.0;
+            double houseW = SnapG(Math.Sqrt(mm2 * 1.5));
+            houseW = Math.Clamp(houseW, STRUCT * 6, bw);
+            double houseD = SnapG(mm2 / Math.Max(houseW, STRUCT));
+            houseD = Math.Clamp(houseD, STRUCT * 4, bd);
+
+            result.BuildingX = bx;
+            result.BuildingY = by;
+            result.BuildingW = houseW;
+            result.BuildingD = houseD;
+
+            // Stem = front 45%, wings = rear 55%
+            double stemD    = Snap(houseD * 0.45, GRID);
+            double wingD    = houseD - stemD;
+            double gapW     = HALLWAY;                         // light court between wings
+            double bedWingW = Snap((houseW - gapW) * 0.55, GRID);
+            bedWingW = Math.Max(bedWingW, STRUCT * 3);
+            double svcWingW = houseW - gapW - bedWingW;
+            svcWingW = Math.Max(svcWingW, STRUCT * 2);
+
+            // "living_left" default: bedroom wing on RIGHT, service on LEFT
+            bool livingOnLeft = !string.Equals(wingOrientation, "living_right",
+                                               StringComparison.OrdinalIgnoreCase);
+            double bedWingX = livingOnLeft ? bx + svcWingW + gapW : bx;
+            double svcWingX = livingOnLeft ? bx                   : bx + bedWingW + gapW;
+            double gapX     = livingOnLeft ? bx + svcWingW        : bx + bedWingW;
+
+            // ── Classify ──────────────────────────────────────────────────────
+            var beds      = all.Where(s => BedTypes.Contains(s.Type))
+                               .OrderByDescending(s => s.AreaSqm).ToList();
+            var fullBaths = all.Where(s => FullBathTypes.Contains(s.Type)).ToList();
+            var halfBaths = all.Where(s => HalfBathTypes.Contains(s.Type)).ToList();
+            var closets   = all.Where(s => ClosetTypes.Contains(s.Type)).ToList();
+            var entries   = all.Where(s => EntryTypes.Contains(s.Type)).ToList();
+            var service   = all.Where(s => ServiceTypes.Contains(s.Type)).ToList();
+            var open      = all.Where(s => OpenPlanTypes.Contains(s.Type)).ToList();
+            var enclairs  = all.Where(s => EnclaireTypes.Contains(s.Type)).ToList();
+
+            var primaryBed  = beds.FirstOrDefault(b =>
+                b.Type is "primary_bedroom" or "primary_suite" or "master_bedroom" ||
+                b.Name.IndexOf("Primary", StringComparison.OrdinalIgnoreCase) >= 0)
+                ?? beds.FirstOrDefault();
+            var primaryBath = fullBaths.FirstOrDefault(b =>
+                b.Type is "primary_bath" or "ensuite_bath" or "ensuite" or "master_bath" ||
+                b.Name.IndexOf("Primary", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                b.Name.IndexOf("En",      StringComparison.OrdinalIgnoreCase) >= 0);
+            var primaryWic  = closets.FirstOrDefault();
+            var secBeds     = beds.Where(b => b != primaryBed).ToList();
+            var remBaths    = fullBaths.Where(b => b != primaryBath).ToList();
+
+            // ── STEM: Open living core (full width) ───────────────────────────
+            double stemY  = by;
+            double entryH = Math.Max(Snap(stemD * 0.28, GRID), STRUCT * 2);
+
+            var entryRoom = entries.FirstOrDefault() ?? new SpaceNode
+            {
+                Name = "Entry", Type = "entry", ZoneName = "circulation",
+                Floor = floor, HasNaturalLight = true, Facing = "south",
+            };
+            if (halfBaths.Any())
+            {
+                double hbW = Snap(houseW * 0.20, GRID);
+                double enW = houseW - hbW;
+                entryRoom.Facing = "south";
+                Place(entryRoom,    bx,       stemY, enW, entryH, result.Rooms);
+                halfBaths[0].Facing = "south";
+                Place(halfBaths[0], bx + enW, stemY, hbW, entryH, result.Rooms);
+            }
+            else
+            {
+                entryRoom.Facing = "south";
+                Place(entryRoom, bx, stemY, houseW, entryH, result.Rooms);
+            }
+            stemY += entryH;
+
+            // Open-plan rooms inside stem — lateral layout (living front, dining+kitchen rear)
+            double openStemH = stemD - entryH;
+            var lB = open.Where(s => s.Type is "living" or "living_room" or "great_room"
+                                     or "family_room" or "open_living").ToList();
+            var dB = open.Where(s => s.Type is "dining" or "dining_room"
+                                     or "breakfast_nook" or "kitchen_dining").ToList();
+            var kB = open.Where(s => s.Type is "kitchen" or "open_kitchen" or "open_plan").ToList();
+            var cls = lB.Concat(dB).Concat(kB).ToHashSet();
+            lB.AddRange(open.Where(s => !cls.Contains(s)));
+            if (!lB.Any() && !dB.Any() && !kB.Any())
+            {
+                double oa = sqm * 0.30;
+                lB.Add(new SpaceNode { Name = "Living Room", Type = "living_room",
+                    Floor = floor, HasNaturalLight = true, AreaSqm = oa * 0.40 });
+                dB.Add(new SpaceNode { Name = "Dining Room", Type = "dining_room",
+                    Floor = floor, HasNaturalLight = true, AreaSqm = oa * 0.25 });
+                kB.Add(new SpaceNode { Name = "Kitchen",     Type = "kitchen",
+                    Floor = floor, HasNaturalLight = true, AreaSqm = oa * 0.35 });
+            }
+            SpaceNode? MergeNodes(List<SpaceNode> bucket, string dName, string dType)
+            {
+                if (!bucket.Any()) return null;
+                if (bucket.Count == 1) return bucket[0];
+                return new SpaceNode { Name = dName, Type = dType,
+                    Floor = bucket[0].Floor, HasNaturalLight = true,
+                    AreaSqm = bucket.Sum(r => Math.Max(r.AreaSqm, 1.0)) };
+            }
+            var lSW = MergeNodes(lB, "Living Room", "living_room");
+            var dSW = MergeNodes(dB, "Dining Room", "dining_room");
+            var kSW = MergeNodes(kB, "Kitchen",     "kitchen");
+
+            if (lSW != null && (dSW != null || kSW != null))
+            {
+                double frontH2 = Snap(openStemH * 0.55, GRID);
+                frontH2 = Math.Max(frontH2, STRUCT * 2);
+                double rearH2  = openStemH - frontH2;
+                rearH2  = Math.Max(rearH2, STRUCT * 2);
+                frontH2 = openStemH - rearH2;
+
+                lSW.IsOpenPlan = true; lSW.ZoneName = "open_plan";
+                lSW.Facing = "south";  lSW.SolarWall = "south";
+                Place(lSW, bx, stemY, houseW, frontH2, result.Rooms);
+                stemY += frontH2;
+
+                if (dSW != null && kSW != null)
+                {
+                    double dkTotal = Math.Max(dSW.AreaSqm, 1.0) + Math.Max(kSW.AreaSqm, 1.0);
+                    double kitFrac = Math.Clamp(kSW.AreaSqm / dkTotal, 0.40, 0.60);
+                    double kitW2   = Snap(houseW * kitFrac, GRID);
+                    double dinW2   = houseW - kitW2;
+                    kitW2 = Math.Max(kitW2, MIN_DIM); dinW2 = Math.Max(dinW2, MIN_DIM);
+
+                    dSW.IsOpenPlan = true; dSW.ZoneName = "open_plan";
+                    dSW.Facing = "north"; dSW.SolarWall = "south";
+                    Place(dSW, bx, stemY, dinW2, rearH2, result.Rooms);
+
+                    kSW.IsOpenPlan = true; kSW.ZoneName = "open_plan";
+                    kSW.Facing = "north"; kSW.SolarWall = "north";
+                    Place(kSW, bx + dinW2, stemY, kitW2, rearH2, result.Rooms);
+                }
+                else if (kSW != null)
+                {
+                    kSW.IsOpenPlan = true; kSW.ZoneName = "open_plan";
+                    kSW.Facing = "north"; kSW.SolarWall = "north";
+                    Place(kSW, bx, stemY, houseW, rearH2, result.Rooms);
+                }
+                else
+                {
+                    dSW!.IsOpenPlan = true; dSW.ZoneName = "open_plan";
+                    dSW.Facing = "north"; dSW.SolarWall = "south";
+                    Place(dSW, bx, stemY, houseW, rearH2, result.Rooms);
+                }
+            }
+            else
+            {
+                var single = lSW ?? kSW ?? dSW;
+                if (single != null)
+                {
+                    single.IsOpenPlan = true; single.ZoneName = "open_plan";
+                    single.Facing = "north"; single.SolarWall = SolarWallForType(N(single.Type));
+                    Place(single, bx, stemY, houseW, openStemH, result.Rooms);
+                }
+            }
+
+            // ── Hallway corridor at wing junction (spans full wing depth − linen) ─
+            double linenSW  = 900;
+            double hallCorW = wingD - linenSW;
+            result.Rooms.Add(new SpaceNode
+            {
+                Name = "Hallway", Type = "corridor", ZoneName = "circulation",
+                Floor = floor, HasNaturalLight = false, Facing = "south",
+                X = gapX, Y = by + stemD, WidthMm = gapW, DepthMm = hallCorW,
+                AreaSqm = gapW * hallCorW / 1_000_000.0,
+            });
+            result.Rooms.Add(new SpaceNode
+            {
+                Name = "Linen", Type = "storage", ZoneName = "circulation",
+                Floor = floor, HasNaturalLight = false, Facing = "north",
+                X = gapX, Y = by + stemD + hallCorW, WidthMm = gapW, DepthMm = linenSW,
+                AreaSqm = gapW * linenSW / 1_000_000.0,
+            });
+
+            // ── BEDROOM WING (rear, one side) ────────────────────────────────
+            var rawHSW = new List<double>();
+            foreach (var _ in secBeds) rawHSW.Add(STRUCT * 3);
+            if (primaryBed != null)    rawHSW.Add(STRUCT * 4);
+            if (!rawHSW.Any())         rawHSW.Add(STRUCT * 4);
+            double rawSumSW = rawHSW.Sum();
+            var rowHSW = rawHSW.Select(h => Snap(h * wingD / rawSumSW, GRID)).ToList();
+            if (rowHSW.Any())
+                rowHSW[^1] = wingD - rowHSW.SkipLast(1).Sum();
+            double capPSW = Snap(STRUCT * 4 * 1.15, GRID);
+            double capSSW = Snap(STRUCT * 3 * 1.15, GRID);
+            for (int i = 0; i < rowHSW.Count; i++)
+                rowHSW[i] = Math.Min(rowHSW[i],
+                    i == rowHSW.Count - 1 && primaryBed != null ? capPSW : capSSW);
+
+            double bedY2 = by + stemD;
+            int riSW = 0;
+            for (int i = 0; i < secBeds.Count && riSW < rowHSW.Count; i++, riSW++)
+            {
+                double rh   = Math.Max(rowHSW[riSW], MIN_DIM);
+                var    bath = i < remBaths.Count ? remBaths[i] : null;
+                double bw2  = bath != null ? Snap(bedWingW * 0.65, GRID) : bedWingW;
+                if (bath != null)
+                    bw2 = ClampAspectRatio(bw2, rh, 0.65, 1.35, MIN_DIM, bedWingW - MIN_DIM);
+                bw2 = Math.Max(bw2, MIN_DIM);
+
+                secBeds[i].Facing = livingOnLeft ? "east" : "west";
+                Place(secBeds[i], bedWingX, bedY2, bw2, rh, result.Rooms);
+                if (bath != null)
+                {
+                    bath.Facing = livingOnLeft ? "east" : "west";
+                    Place(bath, bedWingX + bw2, bedY2, bedWingW - bw2, rh, result.Rooms);
+                }
+                bedY2 += rh;
+            }
+
+            if (primaryBed != null && riSW < rowHSW.Count)
+            {
+                double rh   = Math.Max(rowHSW[riSW], MIN_DIM);
+                bool   hasW = primaryWic  != null;
+                bool   hasB = primaryBath != null;
+
+                double stdBedW2  = StandardDims(primaryBed.Type, primaryBed.AreaSqm).w;
+                double stdExtra2 = (hasW ? StandardDims(primaryWic!.Type,  primaryWic.AreaSqm).w  : 0)
+                                 + (hasB ? StandardDims(primaryBath!.Type, primaryBath.AreaSqm).w : 0);
+                double bedFrac2  = stdBedW2 + stdExtra2 > 0
+                    ? Math.Clamp(stdBedW2 / (stdBedW2 + stdExtra2), 0.40, 0.75)
+                    : (hasW && hasB ? 0.55 : hasB ? 0.65 : 1.0);
+                double bW   = Snap(bedWingW * bedFrac2, GRID);
+                double rem2 = bedWingW - bW;
+                string bf   = livingOnLeft ? "east" : "west";
+
+                primaryBed.Facing = bf;
+                Place(primaryBed, bedWingX, bedY2, bW, rh, result.Rooms);
+                if (hasW && hasB)
+                {
+                    double ww2 = Snap(rem2 * 0.5, GRID);
+                    primaryWic!.Facing = bf; primaryBath!.Facing = bf;
+                    Place(primaryWic,  bedWingX + bW,       bedY2, ww2,        rh, result.Rooms);
+                    Place(primaryBath, bedWingX + bW + ww2, bedY2, rem2 - ww2, rh, result.Rooms);
+                }
+                else if (hasB)
+                {
+                    primaryBath!.Facing = bf;
+                    Place(primaryBath, bedWingX + bW, bedY2, rem2, rh, result.Rooms);
+                }
+                else if (hasW)
+                {
+                    primaryWic!.Facing = bf;
+                    Place(primaryWic, bedWingX + bW, bedY2, rem2, rh, result.Rooms);
+                }
+                bedY2 += rh;
+            }
+            if (bedY2 < by + stemD + wingD - MIN_DIM)
+            {
+                double bonusD2 = by + stemD + wingD - bedY2;
+                result.Rooms.Add(new SpaceNode
+                {
+                    Name = "Storage", Type = "storage", ZoneName = "bedroom_wing",
+                    Floor = floor, HasNaturalLight = false, Facing = "north",
+                    X = bedWingX, Y = bedY2, WidthMm = bedWingW, DepthMm = bonusD2,
+                    AreaSqm = bedWingW * bonusD2 / 1_000_000.0,
+                });
+            }
+
+            // ── SERVICE WING (rear, opposite side) ───────────────────────────
+            var garages2   = service.Where(s => s.Type == "garage").ToList();
+            var nonGarSvc  = service.Where(s => s.Type != "garage").ToList();
+            bool garageFrt = garages2.Any() &&
+                string.Equals(garagePlacement, "front", StringComparison.OrdinalIgnoreCase);
+            double svcY    = by + stemD;
+            double encH2   = enclairs.Any()
+                ? Math.Max(Snap(wingD * 0.35, GRID), STRUCT * 3) : 0;
+            double garH2   = garages2.Any()
+                ? Math.Max(Snap(wingD * 0.40, GRID), 6096.0) : 0;
+            double svcRem  = Math.Max(wingD - encH2 - (garageFrt ? 0 : garH2), 0);
+
+            if (nonGarSvc.Any() && svcRem > MIN_DIM)
+            {
+                double perW2 = Snap(svcWingW / nonGarSvc.Count, GRID);
+                double tmpX  = svcWingX;
+                for (int i = 0; i < nonGarSvc.Count; i++)
+                {
+                    double w = (i == nonGarSvc.Count - 1)
+                        ? svcWingX + svcWingW - tmpX : perW2;
+                    w = Math.Max(w, MIN_DIM);
+                    nonGarSvc[i].Facing = livingOnLeft ? "west" : "east";
+                    Place(nonGarSvc[i], tmpX, svcY, w, svcRem, result.Rooms);
+                    tmpX += w;
+                }
+                svcY += svcRem;
+            }
+            if (enclairs.Any() && encH2 > 0)
+            {
+                double perW2 = Snap(svcWingW / enclairs.Count, GRID);
+                double tmpX  = svcWingX;
+                for (int i = 0; i < enclairs.Count; i++)
+                {
+                    double w = (i == enclairs.Count - 1)
+                        ? svcWingX + svcWingW - tmpX : perW2;
+                    w = Math.Max(w, MIN_DIM);
+                    enclairs[i].Facing = "north"; enclairs[i].HasNaturalLight = true;
+                    enclairs[i].ZoneName = "enclair";
+                    Place(enclairs[i], tmpX, svcY, w, encH2, result.Rooms);
+                    tmpX += w;
+                }
+                svcY += encH2;
+            }
+            if (garages2.Any() && garH2 > 0)
+            {
+                double perW2 = Snap(svcWingW / garages2.Count, GRID);
+                double tmpX  = svcWingX;
+                for (int i = 0; i < garages2.Count; i++)
+                {
+                    double w = (i == garages2.Count - 1)
+                        ? svcWingX + svcWingW - tmpX : perW2;
+                    w = Math.Max(w, MIN_DIM);
+                    garages2[i].Facing = "north";
+                    if (garages2[i].AreaSqm > 30)
+                    {
+                        garages2[i].ZoneName = "adu_capable";
+                        garages2[i].HasNaturalLight = true;
+                    }
+                    Place(garages2[i], tmpX, svcY, w, garH2, result.Rooms);
                     tmpX += w;
                 }
             }
@@ -803,6 +1236,18 @@ namespace zHeight.Plugin.Solver
             "entry"        or "foyer"    or "entry_foyer" or "vestibule"      => "south",
             _                                                                  => "",
         };
+
+        // Clamp room width to enforce architectural aspect ratio (W:D) bounds.
+        // Returns adjusted width; adjacent room should receive (availableW - returnedW).
+        private static double ClampAspectRatio(double w, double d,
+            double minRatio, double maxRatio, double minW, double maxW)
+        {
+            if (d < 1.0) return Math.Clamp(w, minW, maxW);
+            double ratio = w / d;
+            if (ratio > maxRatio) w = Snap(d * maxRatio, GRID);
+            else if (ratio < minRatio) w = Snap(d * minRatio, GRID);
+            return Math.Clamp(w, minW, maxW);
+        }
 
         private static bool NeedsCorridor(string prev, string next) =>
             prev is "centre" or "front" && next is "rear" or "service";
